@@ -43,7 +43,8 @@ type Quote = {
 };
 
 type Config = {
-  rpcUrl: string;
+  quoteRpcUrl: string;
+  txRpcUrl: string;
   executorAddress: string;
   privateKey: string | null;
   poolFee: number;
@@ -124,9 +125,11 @@ function parseAddress(name: string, fallback: string): string {
 
 function loadConfig(): Config {
   const dryRun = parseBool("DRY_RUN", false);
+  const txRpcUrl = optional("TX_RPC_URL") ?? optional("HTTP_RPC_URL") ?? optional("RPC_URL") ?? DEFAULT_RPC_URL;
 
   return {
-    rpcUrl: optional("HTTP_RPC_URL") ?? optional("RPC_URL") ?? DEFAULT_RPC_URL,
+    quoteRpcUrl: optional("QUOTE_RPC_URL") ?? txRpcUrl,
+    txRpcUrl,
     executorAddress: parseAddress("EXECUTOR_CONTRACT_ADDRESS", DEFAULT_EXECUTOR_CONTRACT_ADDRESS),
     privateKey: dryRun ? optional("OWNER_PRIVATE_KEY") : required("OWNER_PRIVATE_KEY"),
     poolFee: parseInteger("POOL_FEE", 500),
@@ -135,7 +138,7 @@ function loadConfig(): Config {
     fineStepEth: parseNumber("FINE_STEP_ETH", 0.5),
     fineWindowEth: parseNumber("FINE_WINDOW_ETH", 10),
     concurrency: parseInteger("QUOTE_CONCURRENCY", 6),
-    intervalMs: parseNonNegativeInteger("MONITOR_INTERVAL_MS", 60_000),
+    intervalMs: parseNonNegativeInteger("MONITOR_INTERVAL_MS", 300_000),
     deviationBps: parseInteger("UPDATE_DEVIATION_BPS", 2_000),
     dryRun
   };
@@ -261,8 +264,12 @@ async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise
   return validFine[0] ?? validCoarse[0];
 }
 
-async function runOnce(provider: JsonRpcProvider, executor: Contract, config: Config): Promise<void> {
-  const best = await findBestQuote(provider, config);
+async function runOnce(
+  quoteProvider: JsonRpcProvider,
+  executor: Contract,
+  config: Config
+): Promise<void> {
+  const best = await findBestQuote(quoteProvider, config);
   const current = BigInt(await executor.maxTargetAweth());
   const shouldUpdate = overDeviationThreshold(best.amountOut, current, config.deviationBps);
 
@@ -299,9 +306,10 @@ async function runOnce(provider: JsonRpcProvider, executor: Contract, config: Co
 
 async function main(): Promise<void> {
   const config = loadConfig();
-  const provider = new JsonRpcProvider(config.rpcUrl, undefined, { staticNetwork: true });
-  const wallet = config.privateKey ? new Wallet(config.privateKey).connect(provider) : null;
-  const executor = new Contract(config.executorAddress, EXECUTOR_ABI, config.dryRun ? provider : wallet);
+  const quoteProvider = new JsonRpcProvider(config.quoteRpcUrl, undefined, { staticNetwork: true });
+  const txProvider = new JsonRpcProvider(config.txRpcUrl, undefined, { staticNetwork: true });
+  const wallet = config.privateKey ? new Wallet(config.privateKey).connect(txProvider) : null;
+  const executor = new Contract(config.executorAddress, EXECUTOR_ABI, config.dryRun ? txProvider : wallet);
 
   try {
     const owner = getAddress(await executor.owner());
@@ -317,6 +325,8 @@ async function main(): Promise<void> {
         "aweth max monitor start",
         `executor=${config.executorAddress}`,
         `owner=${owner}`,
+        `quoteRpc=${config.quoteRpcUrl}`,
+        `txRpc=${config.txRpcUrl}`,
         `poolFee=${config.poolFee}`,
         `intervalMs=${config.intervalMs}`,
         `deviationBps=${config.deviationBps}`,
@@ -324,12 +334,12 @@ async function main(): Promise<void> {
       ].join(" ")
     );
 
-    await runOnce(provider, executor, config);
+    await runOnce(quoteProvider, executor, config);
 
     if (config.intervalMs === 0) return;
 
     const timer = setInterval(() => {
-      runOnce(provider, executor, config).catch((error) => {
+      runOnce(quoteProvider, executor, config).catch((error) => {
         console.error(`[${timestamp()}] monitor failed:`, error);
       });
     }, config.intervalMs);
@@ -337,7 +347,7 @@ async function main(): Promise<void> {
     const shutdown = async (signal: string) => {
       log(`shutdown signal=${signal}`);
       clearInterval(timer);
-      await provider.destroy();
+      await Promise.all([quoteProvider.destroy(), txProvider.destroy()]);
       process.exit(0);
     };
 
@@ -349,7 +359,7 @@ async function main(): Promise<void> {
     });
   } finally {
     if (config.intervalMs === 0) {
-      await provider.destroy();
+      await Promise.all([quoteProvider.destroy(), txProvider.destroy()]);
     }
   }
 }
