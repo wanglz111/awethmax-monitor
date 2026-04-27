@@ -12,7 +12,8 @@ Create `.env` in the same directory as `docker-compose.yml`:
 
 ```env
 OWNER_PRIVATE_KEY=0xYOUR_EXECUTOR_OWNER_PRIVATE_KEY
-HTTP_RPC_URL=https://arb-mainnet.g.alchemy.com/v2/YOUR_KEY
+TX_RPC_URL=https://arb-mainnet.g.alchemy.com/v2/YOUR_KEY
+QUOTE_RPC_URL=https://arb1.arbitrum.io/rpc
 EXECUTOR_CONTRACT_ADDRESS=0x860Ad26c581B533016aC62152De040649208508B
 ```
 
@@ -36,7 +37,9 @@ It also uploads a deploy artifact containing `docker-compose.yml` and `.env.exam
 ## Config
 
 - `OWNER_PRIVATE_KEY`: private key for the executor owner; required unless `DRY_RUN=true`.
-- `HTTP_RPC_URL`: Arbitrum HTTP RPC URL.
+- `TX_RPC_URL`: reliable Arbitrum HTTP RPC URL used for owner checks and update transactions.
+- `QUOTE_RPC_URL`: cheaper/public Arbitrum HTTP RPC URL used for high-volume quote calls. Defaults to `TX_RPC_URL`.
+- `HTTP_RPC_URL` / `RPC_URL`: fallback RPC URL if `TX_RPC_URL` is not set.
 - `EXECUTOR_CONTRACT_ADDRESS`: executor proxy address.
 - `POOL_FEE`: Uniswap V3 pool fee, default `500`.
 - `MAX_AWETH_SCAN_ETH`: upper scan bound, default `400`.
@@ -44,7 +47,7 @@ It also uploads a deploy artifact containing `docker-compose.yml` and `.env.exam
 - `FINE_STEP_ETH`: fine scan step, default `0.5`.
 - `FINE_WINDOW_ETH`: fine scan window around best coarse quote, default `10`.
 - `QUOTE_CONCURRENCY`: concurrent quote calls, default `6`.
-- `MONITOR_INTERVAL_MS`: monitor interval, default `60000`; set `0` to run once.
+- `MONITOR_INTERVAL_MS`: monitor interval, default `300000`; set `0` to run once.
 - `UPDATE_DEVIATION_BPS`: update threshold, default `2000`.
 - `DRY_RUN`: log updates without sending transactions.
 
