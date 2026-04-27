@@ -3,6 +3,7 @@ import "dotenv/config";
 import {
   Contract,
   JsonRpcProvider,
+  WebSocketProvider,
   Wallet,
   formatEther,
   getAddress,
@@ -26,7 +27,8 @@ const QUOTER_ABI = [
 const EXECUTOR_ABI = [
   "function owner() view returns (address)",
   "function maxTargetAweth() view returns (uint256)",
-  "function setMaxTargetAweth(uint256 newMaxTargetAweth)"
+  "function setMaxTargetAweth(uint256 newMaxTargetAweth)",
+  "event ArbitrageExecuted(uint256 flashAmount,uint256 wethSpent,uint256 profit,uint256 kairosPayment,address indexed caller,address indexed profitRecipient)"
 ];
 
 type Quote = {
@@ -45,6 +47,7 @@ type Quote = {
 type Config = {
   quoteRpcUrl: string;
   txRpcUrl: string;
+  wsRpcUrl: string | null;
   executorAddress: string;
   privateKey: string | null;
   poolFee: number;
@@ -128,8 +131,9 @@ function loadConfig(): Config {
   const txRpcUrl = optional("TX_RPC_URL") ?? optional("HTTP_RPC_URL") ?? optional("RPC_URL") ?? DEFAULT_RPC_URL;
 
   return {
-    quoteRpcUrl: optional("QUOTE_RPC_URL") ?? txRpcUrl,
+    quoteRpcUrl: optional("QUOTE_RPC_URL") ?? DEFAULT_RPC_URL,
     txRpcUrl,
+    wsRpcUrl: optional("WS_RPC_URL"),
     executorAddress: parseAddress("EXECUTOR_CONTRACT_ADDRESS", DEFAULT_EXECUTOR_CONTRACT_ADDRESS),
     privateKey: dryRun ? optional("OWNER_PRIVATE_KEY") : required("OWNER_PRIVATE_KEY"),
     poolFee: parseInteger("POOL_FEE", 500),
@@ -138,7 +142,7 @@ function loadConfig(): Config {
     fineStepEth: parseNumber("FINE_STEP_ETH", 0.5),
     fineWindowEth: parseNumber("FINE_WINDOW_ETH", 10),
     concurrency: parseInteger("QUOTE_CONCURRENCY", 6),
-    intervalMs: parseNonNegativeInteger("MONITOR_INTERVAL_MS", 300_000),
+    intervalMs: parseNonNegativeInteger("MONITOR_INTERVAL_MS", 600_000),
     deviationBps: parseInteger("UPDATE_DEVIATION_BPS", 2_000),
     dryRun
   };
@@ -304,12 +308,83 @@ async function runOnce(
   log(`setMaxTargetAweth confirmed block=${receipt.blockNumber}`);
 }
 
+class EvaluationRunner {
+  private inFlight = false;
+  private queuedReason: string | null = null;
+
+  public constructor(
+    private readonly quoteProvider: JsonRpcProvider,
+    private readonly executor: Contract,
+    private readonly config: Config
+  ) {}
+
+  public trigger(reason: string): void {
+    if (this.inFlight) {
+      this.queuedReason = reason;
+      log(`evaluation queued reason=${reason}`);
+      return;
+    }
+
+    this.inFlight = true;
+    void this.runLoop(reason);
+  }
+
+  private async runLoop(initialReason: string): Promise<void> {
+    let reason: string | null = initialReason;
+    while (reason) {
+      log(`evaluation start reason=${reason}`);
+      try {
+        await runOnce(this.quoteProvider, this.executor, this.config);
+      } catch (error) {
+        console.error(`[${timestamp()}] evaluation failed reason=${reason}:`, error);
+      }
+      reason = this.queuedReason;
+      this.queuedReason = null;
+    }
+    this.inFlight = false;
+  }
+}
+
+function startExecuteEventListener(
+  config: Config,
+  runner: EvaluationRunner
+): { provider: WebSocketProvider; contract: Contract } | null {
+  if (!config.wsRpcUrl) {
+    log("execute event listener disabled: WS_RPC_URL not set");
+    return null;
+  }
+
+  const provider = new WebSocketProvider(config.wsRpcUrl);
+  const contract = new Contract(config.executorAddress, EXECUTOR_ABI, provider);
+
+  contract.on("ArbitrageExecuted", (flashAmount, wethSpent, profit, kairosPayment, caller, profitRecipient, event) => {
+    const hash = event?.log?.transactionHash ?? "unknown";
+    log(
+      [
+        "ArbitrageExecuted detected",
+        `hash=${hash}`,
+        `flash=${format(BigInt(flashAmount))}`,
+        `spent=${format(BigInt(wethSpent))}`,
+        `profit=${format(BigInt(profit))}`,
+        `kairos=${format(BigInt(kairosPayment))}`,
+        `caller=${caller}`,
+        `profitRecipient=${profitRecipient}`
+      ].join(" ")
+    );
+    runner.trigger("execute-event");
+  });
+
+  log(`execute event listener start ws=${config.wsRpcUrl}`);
+  return { provider, contract };
+}
+
 async function main(): Promise<void> {
   const config = loadConfig();
   const quoteProvider = new JsonRpcProvider(config.quoteRpcUrl, undefined, { staticNetwork: true });
   const txProvider = new JsonRpcProvider(config.txRpcUrl, undefined, { staticNetwork: true });
   const wallet = config.privateKey ? new Wallet(config.privateKey).connect(txProvider) : null;
   const executor = new Contract(config.executorAddress, EXECUTOR_ABI, config.dryRun ? txProvider : wallet);
+  let executeListener: { provider: WebSocketProvider; contract: Contract } | null = null;
 
   try {
     const owner = getAddress(await executor.owner());
@@ -327,6 +402,7 @@ async function main(): Promise<void> {
         `owner=${owner}`,
         `quoteRpc=${config.quoteRpcUrl}`,
         `txRpc=${config.txRpcUrl}`,
+        `wsRpc=${config.wsRpcUrl ?? "disabled"}`,
         `poolFee=${config.poolFee}`,
         `intervalMs=${config.intervalMs}`,
         `deviationBps=${config.deviationBps}`,
@@ -334,20 +410,30 @@ async function main(): Promise<void> {
       ].join(" ")
     );
 
-    await runOnce(quoteProvider, executor, config);
+    if (config.intervalMs === 0) {
+      await runOnce(quoteProvider, executor, config);
+      return;
+    }
 
-    if (config.intervalMs === 0) return;
+    const runner = new EvaluationRunner(quoteProvider, executor, config);
+    executeListener = startExecuteEventListener(config, runner);
+    runner.trigger("startup");
 
     const timer = setInterval(() => {
-      runOnce(quoteProvider, executor, config).catch((error) => {
-        console.error(`[${timestamp()}] monitor failed:`, error);
-      });
+      runner.trigger("interval");
     }, config.intervalMs);
 
     const shutdown = async (signal: string) => {
       log(`shutdown signal=${signal}`);
       clearInterval(timer);
-      await Promise.all([quoteProvider.destroy(), txProvider.destroy()]);
+      if (executeListener) {
+        await executeListener.contract.removeAllListeners();
+      }
+      await Promise.all([
+        quoteProvider.destroy(),
+        txProvider.destroy(),
+        executeListener?.provider.destroy() ?? Promise.resolve()
+      ]);
       process.exit(0);
     };
 
@@ -359,7 +445,14 @@ async function main(): Promise<void> {
     });
   } finally {
     if (config.intervalMs === 0) {
-      await Promise.all([quoteProvider.destroy(), txProvider.destroy()]);
+      if (executeListener) {
+        await executeListener.contract.removeAllListeners();
+      }
+      await Promise.all([
+        quoteProvider.destroy(),
+        txProvider.destroy(),
+        executeListener?.provider.destroy() ?? Promise.resolve()
+      ]);
     }
   }
 }
