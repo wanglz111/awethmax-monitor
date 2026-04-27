@@ -47,3 +47,4 @@ It also uploads a deploy artifact containing `docker-compose.yml` and `.env.exam
 - `MONITOR_INTERVAL_MS`: monitor interval, default `60000`; set `0` to run once.
 - `UPDATE_DEVIATION_BPS`: update threshold, default `2000`.
 - `DRY_RUN`: log updates without sending transactions.
+
