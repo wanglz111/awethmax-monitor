@@ -4,6 +4,8 @@ Monitors the recommended `maxTargetAweth` for the Arbitrum aWETH/WETH pool and u
 
 Default threshold is `2000` bps, meaning strictly more than 20%.
 
+If no profitable quote exists, the monitor recommends `1 wei` instead of `0`, because `0` means unlimited on the executor contract.
+
 ## Server Run
 
 Create `.env` in the same directory as `docker-compose.yml`:
