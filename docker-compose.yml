@@ -1,0 +1,15 @@
+services:
+  awethmax-monitor:
+    image: ghcr.io/wanglz111/awethmax-monitor:latest
+    env_file:
+      - .env
+    volumes:
+      - ./.env:/app/.env:ro
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
