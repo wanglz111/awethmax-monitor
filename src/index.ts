@@ -59,6 +59,15 @@ type Config = {
   intervalMs: number;
   deviationBps: number;
   dryRun: boolean;
+  barkBaseUrl: string;
+  barkDeviceKey: string | null;
+  barkTitle: string;
+  barkGroup: string;
+};
+
+type BarkNotification = {
+  title?: string;
+  body: string;
 };
 
 function timestamp(): string {
@@ -144,12 +153,21 @@ function loadConfig(): Config {
     concurrency: parseInteger("QUOTE_CONCURRENCY", 6),
     intervalMs: parseNonNegativeInteger("MONITOR_INTERVAL_MS", 600_000),
     deviationBps: parseInteger("UPDATE_DEVIATION_BPS", 2_000),
-    dryRun
+    dryRun,
+    barkBaseUrl: optional("BARK_BASE_URL") ?? "https://api.day.app",
+    barkDeviceKey: optional("BARK_DEVICE_KEY"),
+    barkTitle: optional("BARK_TITLE") ?? "aWETH Max Monitor",
+    barkGroup: optional("BARK_GROUP") ?? "AAVE_ARB"
   };
 }
 
 function format(value: bigint): string {
   return Number(formatEther(value)).toFixed(6);
+}
+
+function shortHash(hash: string): string {
+  if (hash.length <= 18) return hash;
+  return `${hash.slice(0, 10)}...${hash.slice(-8)}`;
 }
 
 function range(start: number, end: number, step: number): number[] {
@@ -201,6 +219,45 @@ function fallbackQuote(): Quote {
     ticksCrossed: 0,
     gasEstimate: 0
   };
+}
+
+class BarkNotifier {
+  private readonly endpoint: string;
+
+  public constructor(
+    baseUrl: string,
+    private readonly deviceKey: string,
+    private readonly defaultTitle: string,
+    private readonly group: string
+  ) {
+    this.endpoint = `${baseUrl.replace(/\/+$/, "")}/${encodeURIComponent(deviceKey)}`;
+  }
+
+  public async send(notification: BarkNotification): Promise<void> {
+    const payload: Record<string, string> = {
+      title: notification.title ?? this.defaultTitle,
+      body: notification.body,
+      group: this.group
+    };
+
+    try {
+      const response = await fetch(this.endpoint, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      if (!response.ok) {
+        console.warn(`[bark] HTTP ${response.status}`);
+      }
+    } catch (error) {
+      console.warn("[bark] send failed:", error);
+    }
+  }
+}
+
+function sendNotification(notifier: BarkNotifier | null, notification: BarkNotification): void {
+  if (!notifier) return;
+  void notifier.send(notification);
 }
 
 async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise<Quote> {
@@ -271,7 +328,8 @@ async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise
 async function runOnce(
   quoteProvider: JsonRpcProvider,
   executor: Contract,
-  config: Config
+  config: Config,
+  notifier: BarkNotifier | null
 ): Promise<void> {
   const best = await findBestQuote(quoteProvider, config);
   const current = BigInt(await executor.maxTargetAweth());
@@ -306,6 +364,18 @@ async function runOnce(
     throw new Error(`setMaxTargetAweth failed hash=${tx.hash}`);
   }
   log(`setMaxTargetAweth confirmed block=${receipt.blockNumber}`);
+
+  sendNotification(notifier, {
+    title: "aWETH Cap Updated",
+    body: [
+      `New cap: ${format(best.amountOut)} aWETH`,
+      `Old cap: ${format(current)} aWETH`,
+      `Reason: ${best.reason}`,
+      `Delta: ${deviationBps(best.amountOut, current)} bps`,
+      `Tx: ${shortHash(tx.hash)}`,
+      `Block: ${receipt.blockNumber}`
+    ].join("\n")
+  });
 }
 
 class EvaluationRunner {
@@ -315,7 +385,8 @@ class EvaluationRunner {
   public constructor(
     private readonly quoteProvider: JsonRpcProvider,
     private readonly executor: Contract,
-    private readonly config: Config
+    private readonly config: Config,
+    private readonly notifier: BarkNotifier | null
   ) {}
 
   public trigger(reason: string): void {
@@ -334,9 +405,13 @@ class EvaluationRunner {
     while (reason) {
       log(`evaluation start reason=${reason}`);
       try {
-        await runOnce(this.quoteProvider, this.executor, this.config);
+        await runOnce(this.quoteProvider, this.executor, this.config, this.notifier);
       } catch (error) {
         console.error(`[${timestamp()}] evaluation failed reason=${reason}:`, error);
+        sendNotification(this.notifier, {
+          title: "aWETH Monitor Failed",
+          body: [`Reason: ${reason}`, `Error: ${error instanceof Error ? error.message : String(error)}`].join("\n")
+        });
       }
       reason = this.queuedReason;
       this.queuedReason = null;
@@ -347,7 +422,8 @@ class EvaluationRunner {
 
 function startExecuteEventListener(
   config: Config,
-  runner: EvaluationRunner
+  runner: EvaluationRunner,
+  notifier: BarkNotifier | null
 ): { provider: WebSocketProvider; contract: Contract } | null {
   if (!config.wsRpcUrl) {
     log("execute event listener disabled: WS_RPC_URL not set");
@@ -371,6 +447,15 @@ function startExecuteEventListener(
         `profitRecipient=${profitRecipient}`
       ].join(" ")
     );
+    sendNotification(notifier, {
+      title: "Executor Succeeded",
+      body: [
+        `Profit: ${format(BigInt(profit))} WETH`,
+        `Flash: ${format(BigInt(flashAmount))} WETH`,
+        `Spent: ${format(BigInt(wethSpent))} WETH`,
+        `Tx: ${shortHash(hash)}`
+      ].join("\n")
+    });
     runner.trigger("execute-event");
   });
 
@@ -384,6 +469,9 @@ async function main(): Promise<void> {
   const txProvider = new JsonRpcProvider(config.txRpcUrl, undefined, { staticNetwork: true });
   const wallet = config.privateKey ? new Wallet(config.privateKey).connect(txProvider) : null;
   const executor = new Contract(config.executorAddress, EXECUTOR_ABI, config.dryRun ? txProvider : wallet);
+  const notifier = config.barkDeviceKey
+    ? new BarkNotifier(config.barkBaseUrl, config.barkDeviceKey, config.barkTitle, config.barkGroup)
+    : null;
   let executeListener: { provider: WebSocketProvider; contract: Contract } | null = null;
 
   try {
@@ -406,17 +494,18 @@ async function main(): Promise<void> {
         `poolFee=${config.poolFee}`,
         `intervalMs=${config.intervalMs}`,
         `deviationBps=${config.deviationBps}`,
-        `dryRun=${config.dryRun}`
+        `dryRun=${config.dryRun}`,
+        `bark=${notifier ? "enabled" : "disabled"}`
       ].join(" ")
     );
 
     if (config.intervalMs === 0) {
-      await runOnce(quoteProvider, executor, config);
+      await runOnce(quoteProvider, executor, config, notifier);
       return;
     }
 
-    const runner = new EvaluationRunner(quoteProvider, executor, config);
-    executeListener = startExecuteEventListener(config, runner);
+    const runner = new EvaluationRunner(quoteProvider, executor, config, notifier);
+    executeListener = startExecuteEventListener(config, runner, notifier);
     runner.trigger("startup");
 
     const timer = setInterval(() => {

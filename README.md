@@ -14,7 +14,11 @@ Create `.env` in the same directory as `docker-compose.yml`:
 OWNER_PRIVATE_KEY=0xYOUR_EXECUTOR_OWNER_PRIVATE_KEY
 TX_RPC_URL=https://arb-mainnet.g.alchemy.com/v2/YOUR_KEY
 WS_RPC_URL=wss://arb-mainnet.g.alchemy.com/v2/YOUR_KEY
-EXECUTOR_CONTRACT_ADDRESS=0x860Ad26c581B533016aC62152De040649208508B
+
+BARK_BASE_URL=https://api.day.app
+BARK_DEVICE_KEY=YOUR_BARK_DEVICE_KEY
+BARK_TITLE=aWETH Max Monitor
+BARK_GROUP=AAVE_ARB
 ```
 
 Run:
@@ -40,15 +44,8 @@ It also uploads a deploy artifact containing `docker-compose.yml` and `.env.exam
 - `TX_RPC_URL`: reliable Arbitrum HTTP RPC URL used for owner checks and update transactions.
 - `WS_RPC_URL`: Arbitrum WebSocket RPC URL used to listen for successful executor `ArbitrageExecuted` events.
 - `QUOTE_RPC_URL`: cheaper/public Arbitrum HTTP RPC URL used for high-volume quote calls. Defaults to `https://arb1.arbitrum.io/rpc`.
-- `HTTP_RPC_URL` / `RPC_URL`: fallback RPC URL if `TX_RPC_URL` is not set.
+- `BARK_DEVICE_KEY`: enables Bark notifications when set.
+- `BARK_TITLE`: default notification title, default `aWETH Max Monitor`.
+- `BARK_GROUP`: Bark group, default `AAVE_ARB`.
 - `EXECUTOR_CONTRACT_ADDRESS`: executor proxy address.
-- `POOL_FEE`: Uniswap V3 pool fee, default `500`.
-- `MAX_AWETH_SCAN_ETH`: upper scan bound, default `400`.
-- `COARSE_STEP_ETH`: coarse scan step, default `5`.
-- `FINE_STEP_ETH`: fine scan step, default `0.5`.
-- `FINE_WINDOW_ETH`: fine scan window around best coarse quote, default `10`.
-- `QUOTE_CONCURRENCY`: concurrent quote calls, default `6`.
 - `MONITOR_INTERVAL_MS`: monitor interval, default `600000`; set `0` to run once without the event listener.
-- `UPDATE_DEVIATION_BPS`: update threshold, default `2000`.
-- `DRY_RUN`: log updates without sending transactions.
-
