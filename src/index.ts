@@ -288,6 +288,16 @@ function deviationBps(next: bigint, current: bigint): string {
   return ((delta * SCALE_BPS) / current).toString();
 }
 
+function errorCode(error: unknown): string | null {
+  return typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
+    ? error.code
+    : null;
+}
+
+function isQuoteRevert(error: unknown): boolean {
+  return errorCode(error) === "CALL_EXCEPTION";
+}
+
 function fallbackQuote(): Quote {
   return {
     reason: "no-profitable-quote",
@@ -345,48 +355,84 @@ function sendNotification(notifier: BarkNotifier | null, notification: BarkNotif
 
 async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise<Quote> {
   const multicall = new Contract(MULTICALL3, MULTICALL3_ABI, provider);
+  const quoter = new Contract(QUOTER_V2, QUOTER_ABI, provider);
   const quoterInterface = new Interface(QUOTER_ABI);
 
-  function buildQuote(fee: number, outEth: number, returnData: string): Quote | null {
+  function buildQuoteFromResult(
+    fee: number,
+    outEth: number,
+    amountIn: bigint,
+    sqrtPriceX96After: bigint,
+    ticksCrossed: bigint,
+    gasEstimate: bigint
+  ): Quote {
     const amountOut = parseEther(String(outEth));
+    const maxIn = amountIn + (amountIn * INPUT_BUFFER_BPS) / SCALE_BPS;
+    const bufferedProfit = amountOut - maxIn;
 
+    return {
+      reason: "profitable-quote",
+      fee,
+      outEth,
+      amountOut,
+      amountIn,
+      maxIn,
+      bufferedProfit,
+      profitBps: (bufferedProfit * SCALE_BPS) / amountOut,
+      sqrtPriceX96After,
+      ticksCrossed: Number(ticksCrossed),
+      gasEstimate: Number(gasEstimate)
+    };
+  }
+
+  function buildQuote(fee: number, outEth: number, returnData: string): Quote | null {
     try {
       const [amountIn, sqrtPriceX96After, ticksCrossed, gasEstimate] =
         quoterInterface.decodeFunctionResult("quoteExactOutputSingle", returnData);
-      const maxIn = amountIn + (amountIn * INPUT_BUFFER_BPS) / SCALE_BPS;
-      const bufferedProfit = amountOut - maxIn;
-
-      return {
-        reason: "profitable-quote",
-        fee,
-        outEth,
-        amountOut,
-        amountIn,
-        maxIn,
-        bufferedProfit,
-        profitBps: (bufferedProfit * SCALE_BPS) / amountOut,
-        sqrtPriceX96After,
-        ticksCrossed: Number(ticksCrossed),
-        gasEstimate: Number(gasEstimate)
-      };
+      return buildQuoteFromResult(fee, outEth, amountIn, sqrtPriceX96After, ticksCrossed, gasEstimate);
     } catch {
       return null;
     }
   }
 
+  function quoteParams(fee: number, outEth: number) {
+    return {
+      tokenIn: WETH,
+      tokenOut: AWETH,
+      amount: parseEther(String(outEth)),
+      fee,
+      sqrtPriceLimitX96: MIN_SQRT_RATIO_PLUS_ONE
+    };
+  }
+
+  async function quoteSingle(fee: number, outEth: number): Promise<Quote | null> {
+    try {
+      const [amountIn, sqrtPriceX96After, ticksCrossed, gasEstimate] =
+        await quoter.quoteExactOutputSingle.staticCall(quoteParams(fee, outEth));
+      return buildQuoteFromResult(fee, outEth, amountIn, sqrtPriceX96After, ticksCrossed, gasEstimate);
+    } catch (error) {
+      if (!isQuoteRevert(error)) throw error;
+      return null;
+    }
+  }
+
+  async function quoteSingles(fee: number, outEthValues: number[]): Promise<Array<Quote | null>> {
+    const quotes: Array<Quote | null> = [];
+    for (const outEth of outEthValues) {
+      quotes.push(await quoteSingle(fee, outEth));
+    }
+    return quotes;
+  }
+
   async function quoteBatch(fee: number, outEthValues: number[]): Promise<Array<Quote | null>> {
+    if (outEthValues.length === 1) {
+      return quoteSingles(fee, outEthValues);
+    }
+
     const calls = outEthValues.map((outEth) => ({
       target: QUOTER_V2,
       allowFailure: true,
-      callData: quoterInterface.encodeFunctionData("quoteExactOutputSingle", [
-        {
-          tokenIn: WETH,
-          tokenOut: AWETH,
-          amount: parseEther(String(outEth)),
-          fee,
-          sqrtPriceLimitX96: MIN_SQRT_RATIO_PLUS_ONE
-        }
-      ])
+      callData: quoterInterface.encodeFunctionData("quoteExactOutputSingle", [quoteParams(fee, outEth)])
     }));
 
     try {
@@ -396,14 +442,7 @@ async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise
         return buildQuote(fee, outEthValues[index], result.returnData);
       });
     } catch (error) {
-      if (outEthValues.length === 1) throw error;
-      const midpoint = Math.ceil(outEthValues.length / 2);
-      log(`quote multicall batch failed size=${outEthValues.length}; retrying split batches`);
-      const [left, right] = await Promise.all([
-        quoteBatch(fee, outEthValues.slice(0, midpoint)),
-        quoteBatch(fee, outEthValues.slice(midpoint))
-      ]);
-      return [...left, ...right];
+      return quoteSingles(fee, outEthValues);
     }
   }
 
@@ -449,7 +488,6 @@ async function runOnce(
     best = await findBestQuote(quoteProvider, config);
   } catch (error) {
     if (!quoteFallbackProvider) throw error;
-    console.warn(`[${timestamp()}] public quote RPC failed; retrying with fallback RPC:`, error);
     best = await findBestQuote(quoteFallbackProvider, config);
   }
   const current = BigInt(await executor.maxTargetAweth());
