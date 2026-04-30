@@ -55,6 +55,7 @@ const EXECUTOR_ABI = [
 
 type Quote = {
   reason: "profitable-quote" | "no-profitable-quote";
+  fee: number;
   outEth: number;
   amountOut: bigint;
   amountIn: bigint;
@@ -75,6 +76,7 @@ type Config = {
   poolAddress: string | null;
   privateKey: string | null;
   poolFee: number;
+  poolFees: number[];
   maxEth: number;
   coarseStepEth: number;
   fineStepEth: number;
@@ -152,6 +154,19 @@ function parseInteger(name: string, fallback: number): number {
   return parsed;
 }
 
+function parseIntegerList(name: string): number[] {
+  const value = optional(name);
+  if (!value) return [];
+
+  return value.split(",").map((item) => {
+    const parsed = Number.parseInt(item.trim(), 10);
+    if (!Number.isInteger(parsed) || parsed <= 0) {
+      throw new Error(`Invalid positive integer list in ${name}: ${value}`);
+    }
+    return parsed;
+  });
+}
+
 function parseNonNegativeInteger(name: string, fallback: number): number {
   const value = optional(name);
   if (!value) return fallback;
@@ -173,6 +188,8 @@ function parseAddress(name: string, fallback: string): string {
 function loadConfig(): Config {
   const dryRun = parseBool("DRY_RUN", false);
   const txRpcUrl = optional("TX_RPC_URL") ?? optional("HTTP_RPC_URL") ?? optional("RPC_URL") ?? DEFAULT_RPC_URL;
+  const poolFee = parseInteger("POOL_FEE", 500);
+  const poolFees = parseIntegerList("POOL_FEES");
 
   return {
     quoteRpcUrl: DEFAULT_RPC_URL,
@@ -182,7 +199,8 @@ function loadConfig(): Config {
     executorAddress: parseAddress("EXECUTOR_CONTRACT_ADDRESS", DEFAULT_EXECUTOR_CONTRACT_ADDRESS),
     poolAddress: optional("POOL_ADDRESS") ? parseAddress("POOL_ADDRESS", ZERO_ADDRESS) : null,
     privateKey: dryRun ? optional("OWNER_PRIVATE_KEY") : required("OWNER_PRIVATE_KEY"),
-    poolFee: parseInteger("POOL_FEE", 500),
+    poolFee,
+    poolFees: poolFees.length > 0 ? poolFees : [poolFee],
     maxEth: parseNumber("MAX_AWETH_SCAN_ETH", 400),
     coarseStepEth: parseNumber("COARSE_STEP_ETH", 5),
     fineStepEth: parseNumber("FINE_STEP_ETH", 0.5),
@@ -273,6 +291,7 @@ function deviationBps(next: bigint, current: bigint): string {
 function fallbackQuote(): Quote {
   return {
     reason: "no-profitable-quote",
+    fee: 0,
     outEth: 0,
     amountOut: 1n,
     amountIn: 0n,
@@ -328,7 +347,7 @@ async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise
   const multicall = new Contract(MULTICALL3, MULTICALL3_ABI, provider);
   const quoterInterface = new Interface(QUOTER_ABI);
 
-  function buildQuote(outEth: number, returnData: string): Quote | null {
+  function buildQuote(fee: number, outEth: number, returnData: string): Quote | null {
     const amountOut = parseEther(String(outEth));
 
     try {
@@ -339,6 +358,7 @@ async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise
 
       return {
         reason: "profitable-quote",
+        fee,
         outEth,
         amountOut,
         amountIn,
@@ -354,7 +374,7 @@ async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise
     }
   }
 
-  async function quoteBatch(outEthValues: number[]): Promise<Array<Quote | null>> {
+  async function quoteBatch(fee: number, outEthValues: number[]): Promise<Array<Quote | null>> {
     const calls = outEthValues.map((outEth) => ({
       target: QUOTER_V2,
       allowFailure: true,
@@ -363,7 +383,7 @@ async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise
           tokenIn: WETH,
           tokenOut: AWETH,
           amount: parseEther(String(outEth)),
-          fee: config.poolFee,
+          fee,
           sqrtPriceLimitX96: MIN_SQRT_RATIO_PLUS_ONE
         }
       ])
@@ -373,23 +393,25 @@ async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise
       const results = await multicall.aggregate3.staticCall(calls);
       return results.map((result: { success: boolean; returnData: string }, index: number) => {
         if (!result.success) return null;
-        return buildQuote(outEthValues[index], result.returnData);
+        return buildQuote(fee, outEthValues[index], result.returnData);
       });
     } catch (error) {
       if (outEthValues.length === 1) throw error;
       const midpoint = Math.ceil(outEthValues.length / 2);
       log(`quote multicall batch failed size=${outEthValues.length}; retrying split batches`);
       const [left, right] = await Promise.all([
-        quoteBatch(outEthValues.slice(0, midpoint)),
-        quoteBatch(outEthValues.slice(midpoint))
+        quoteBatch(fee, outEthValues.slice(0, midpoint)),
+        quoteBatch(fee, outEthValues.slice(midpoint))
       ]);
       return [...left, ...right];
     }
   }
 
   async function quoteMany(outEthValues: number[]): Promise<Array<Quote | null>> {
-    const batches = chunk(outEthValues, config.quoteBatchSize);
-    const batchQuotes = await mapLimit(batches, config.concurrency, quoteBatch);
+    const batches = config.poolFees.flatMap((fee) =>
+      chunk(outEthValues, config.quoteBatchSize).map((values) => ({ fee, values }))
+    );
+    const batchQuotes = await mapLimit(batches, config.concurrency, (batch) => quoteBatch(batch.fee, batch.values));
     return batchQuotes.flat();
   }
 
@@ -436,6 +458,7 @@ async function runOnce(
   log(
     [
       `recommended=${format(best.amountOut)}aWETH`,
+      `fee=${best.fee}`,
       `reason=${best.reason}`,
       `onchain=${format(current)}aWETH`,
       `deltaBps=${deviationBps(best.amountOut, current)}`,
@@ -468,6 +491,7 @@ async function runOnce(
     body: [
       `New cap: ${format(best.amountOut)} aWETH`,
       `Old cap: ${format(current)} aWETH`,
+      `Fee: ${best.fee}`,
       `Reason: ${best.reason}`,
       `Delta: ${deviationBps(best.amountOut, current)} bps`,
       `Tx: ${shortHash(tx.hash)}`,
@@ -651,6 +675,66 @@ async function startPoolEventListener(
   return { contract };
 }
 
+async function resolvePoolAddressForFee(
+  provider: JsonRpcProvider,
+  fallbackProvider: JsonRpcProvider | null,
+  config: Config,
+  fee: number
+): Promise<string> {
+  try {
+    const factory = new Contract(UNISWAP_V3_FACTORY, FACTORY_ABI, provider);
+    const pool = getAddress(await factory.getPool(WETH, AWETH, fee));
+    if (pool === ZERO_ADDRESS) {
+      throw new Error(`No Uniswap V3 pool found for WETH/aWETH fee=${fee}`);
+    }
+    return pool;
+  } catch (error) {
+    if (!fallbackProvider) throw error;
+    console.warn(`[${timestamp()}] public RPC failed resolving pool fee=${fee}; retrying with fallback RPC:`, error);
+    const factory = new Contract(UNISWAP_V3_FACTORY, FACTORY_ABI, fallbackProvider);
+    const pool = getAddress(await factory.getPool(WETH, AWETH, fee));
+    if (pool === ZERO_ADDRESS) {
+      throw new Error(`No Uniswap V3 pool found for WETH/aWETH fee=${fee}`);
+    }
+    return pool;
+  }
+}
+
+async function startPoolEventListeners(
+  config: Config,
+  quoteProvider: JsonRpcProvider,
+  quoteFallbackProvider: JsonRpcProvider | null,
+  provider: WebSocketProvider,
+  runner: EvaluationRunner
+): Promise<ContractListener[]> {
+  if (config.poolAddress) {
+    return [await startPoolEventListener(config, quoteProvider, quoteFallbackProvider, provider, runner)];
+  }
+
+  const eventNames = ["Swap", "Mint", "Burn", "Collect", "Flash"] as const;
+  const poolEntries = await Promise.all(
+    config.poolFees.map(async (fee) => ({
+      fee,
+      poolAddress: await resolvePoolAddressForFee(quoteProvider, quoteFallbackProvider, config, fee)
+    }))
+  );
+
+  return poolEntries.map(({ fee, poolAddress }) => {
+    const contract = new Contract(poolAddress, POOL_ABI, provider);
+    for (const eventName of eventNames) {
+      contract.on(eventName, (...args) => {
+        const event = args[args.length - 1];
+        const hash = event?.log?.transactionHash ?? "unknown";
+        const blockNumber = event?.log?.blockNumber ?? "unknown";
+        log(`pool ${eventName} detected fee=${fee} pool=${poolAddress} hash=${hash} block=${blockNumber}`);
+        runner.triggerEvent(`pool-${fee}-${eventName.toLowerCase()}`, hash);
+      });
+    }
+    log(`pool event listener registered fee=${fee} pool=${poolAddress} events=${eventNames.join(",")}`);
+    return { contract };
+  });
+}
+
 class WebSocketEventManager {
   private provider: WebSocketProvider | null = null;
   private listeners: ContractListener[] = [];
@@ -692,13 +776,13 @@ class WebSocketEventManager {
       this.attachSocketHandlers(provider);
       const listeners = [
         startExecuteEventListener(this.config, provider, this.runner, this.notifier),
-        await startPoolEventListener(
+        ...(await startPoolEventListeners(
           this.config,
           this.quoteProvider,
           this.quoteFallbackProvider,
           provider,
           this.runner
-        )
+        ))
       ];
       if (this.stopped || this.provider !== provider) {
         await Promise.all(listeners.map((listener) => listener.contract.removeAllListeners()));
@@ -806,7 +890,7 @@ async function main(): Promise<void> {
       `txRpc=${redactUrl(config.txRpcUrl)}`,
       `wsRpc=${config.wsRpcUrl ? redactUrl(config.wsRpcUrl) : "disabled"}`,
       `poolAddress=${config.poolAddress ?? "auto"}`,
-      `poolFee=${config.poolFee}`,
+      `poolFees=${config.poolFees.join(",")}`,
       `quoteBatchSize=${config.quoteBatchSize}`,
       `eventDebounceMs=${config.eventDebounceMs}`,
       `intervalMs=${config.intervalMs}`,

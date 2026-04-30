@@ -2,7 +2,7 @@
 
 Monitors the recommended `maxTargetAweth` for the Arbitrum aWETH/WETH Uniswap V3 pool and updates the executor contract only when the recommendation deviates from the on-chain value by more than `UPDATE_DEVIATION_BPS`.
 
-Default threshold is `2000` bps, meaning strictly more than 20%. The monitor runs every 10 minutes by default, evaluates immediately after a successful `ArbitrageExecuted` event from the executor contract, and re-evaluates immediately when the 500 fee pool emits `Swap`, `Mint`, `Burn`, `Collect`, or `Flash`.
+Default threshold is `2000` bps, meaning strictly more than 20%. The monitor runs every 10 minutes by default, evaluates immediately after a successful `ArbitrageExecuted` event from the executor contract, and re-evaluates immediately when any configured fee pool emits `Swap`, `Mint`, `Burn`, `Collect`, or `Flash`.
 
 If the WebSocket connection closes or errors, the monitor tears down the old event listeners and reconnects after 5 seconds. The periodic interval continues to run as a fallback while WebSocket events are unavailable.
 
@@ -20,6 +20,7 @@ Create `.env` in the same directory as `docker-compose.yml`:
 OWNER_PRIVATE_KEY=0xYOUR_EXECUTOR_OWNER_PRIVATE_KEY
 TX_RPC_URL=https://arb-mainnet.g.alchemy.com/v2/YOUR_KEY
 WS_RPC_URL=wss://arb-mainnet.g.alchemy.com/v2/YOUR_KEY
+POOL_FEES=100,500
 
 BARK_BASE_URL=https://api.day.app
 BARK_DEVICE_KEY=YOUR_BARK_DEVICE_KEY
@@ -55,8 +56,9 @@ It also uploads a deploy artifact containing `docker-compose.yml` and `.env.exam
 - `BARK_TITLE`: default notification title, default `aWETH Max Monitor`.
 - `BARK_GROUP`: Bark group, default `AAVE_ARB`.
 - `EXECUTOR_CONTRACT_ADDRESS`: executor proxy address.
-- `POOL_ADDRESS`: optional Uniswap V3 pool address. Leave unset to auto-resolve the WETH/aWETH pool from `POOL_FEE`.
-- `POOL_FEE`: Uniswap V3 pool fee tier, default `500`.
+- `POOL_ADDRESS`: optional Uniswap V3 pool address. Leave unset to auto-resolve the WETH/aWETH pools from `POOL_FEES`.
+- `POOL_FEES`: comma-separated Uniswap V3 pool fee tiers to scan and listen to, for example `100,500`.
+- `POOL_FEE`: backward-compatible single fee tier, default `500`, used only when `POOL_FEES` is unset.
 - `QUOTE_BATCH_SIZE`: number of quote calls per Multicall3 request, default `20`.
 - `QUOTE_CONCURRENCY`: number of Multicall3 quote batches to run concurrently, default `6`.
 - `EVENT_DEBOUNCE_MS`: delay used to merge pool/executor events before re-evaluating, default `2000`.
