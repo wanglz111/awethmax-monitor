@@ -4,6 +4,8 @@ Monitors the recommended `maxTargetAweth` for the Arbitrum aWETH/WETH Uniswap V3
 
 Default threshold is `2000` bps, meaning strictly more than 20%. The monitor runs every 10 minutes by default, evaluates immediately after a successful `ArbitrageExecuted` event from the executor contract, and re-evaluates immediately when the 500 fee pool emits `Swap`, `Mint`, `Burn`, `Collect`, or `Flash`.
 
+If the WebSocket connection closes or errors, the monitor tears down the old event listeners and reconnects after 5 seconds. The periodic interval continues to run as a fallback while WebSocket events are unavailable.
+
 Set `MONITOR_INTERVAL_MS=0` to disable the periodic fallback and run from startup plus WebSocket events only.
 
 If no profitable quote exists, the monitor recommends `1 wei` instead of `0`, because `0` means unlimited on the executor contract.

@@ -21,6 +21,7 @@ const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const MIN_SQRT_RATIO_PLUS_ONE = 4_295_128_740n;
 const SCALE_BPS = 10_000n;
 const INPUT_BUFFER_BPS = 1n;
+const WS_RECONNECT_DELAY_MS = 5_000;
 
 const QUOTER_ABI = [
   "function quoteExactOutputSingle((address tokenIn,address tokenOut,uint256 amount,uint24 fee,uint160 sqrtPriceLimitX96) params) returns (uint256 amountIn,uint160 sqrtPriceX96After,uint32 initializedTicksCrossed,uint256 gasEstimate)"
@@ -83,6 +84,15 @@ type Config = {
 type BarkNotification = {
   title?: string;
   body: string;
+};
+
+type WebSocketLikeWithEvents = {
+  on?: (event: string, listener: (...args: unknown[]) => void) => void;
+  addEventListener?: (event: string, listener: (...args: unknown[]) => void) => void;
+};
+
+type ContractListener = {
+  contract: Contract;
 };
 
 function timestamp(): string {
@@ -438,15 +448,10 @@ class EvaluationRunner {
 
 function startExecuteEventListener(
   config: Config,
+  provider: WebSocketProvider,
   runner: EvaluationRunner,
   notifier: BarkNotifier | null
-): { provider: WebSocketProvider; contract: Contract } | null {
-  if (!config.wsRpcUrl) {
-    log("execute event listener disabled: WS_RPC_URL not set");
-    return null;
-  }
-
-  const provider = new WebSocketProvider(config.wsRpcUrl);
+): ContractListener {
   const contract = new Contract(config.executorAddress, EXECUTOR_ABI, provider);
 
   contract.on("ArbitrageExecuted", (flashAmount, wethSpent, profit, kairosPayment, caller, profitRecipient, event) => {
@@ -475,8 +480,8 @@ function startExecuteEventListener(
     runner.trigger("execute-event");
   });
 
-  log(`execute event listener start ws=${config.wsRpcUrl}`);
-  return { provider, contract };
+  log("execute event listener registered");
+  return { contract };
 }
 
 async function resolvePoolAddress(provider: JsonRpcProvider, config: Config): Promise<string> {
@@ -493,15 +498,10 @@ async function resolvePoolAddress(provider: JsonRpcProvider, config: Config): Pr
 async function startPoolEventListener(
   config: Config,
   quoteProvider: JsonRpcProvider,
+  provider: WebSocketProvider,
   runner: EvaluationRunner
-): Promise<{ provider: WebSocketProvider; contract: Contract; poolAddress: string } | null> {
-  if (!config.wsRpcUrl) {
-    log("pool event listener disabled: WS_RPC_URL not set");
-    return null;
-  }
-
+): Promise<ContractListener> {
   const poolAddress = await resolvePoolAddress(quoteProvider, config);
-  const provider = new WebSocketProvider(config.wsRpcUrl);
   const contract = new Contract(poolAddress, POOL_ABI, provider);
   const eventNames = ["Swap", "Mint", "Burn", "Collect", "Flash"] as const;
 
@@ -515,8 +515,122 @@ async function startPoolEventListener(
     });
   }
 
-  log(`pool event listener start pool=${poolAddress} events=${eventNames.join(",")} ws=${config.wsRpcUrl}`);
-  return { provider, contract, poolAddress };
+  log(`pool event listener registered pool=${poolAddress} events=${eventNames.join(",")}`);
+  return { contract };
+}
+
+class WebSocketEventManager {
+  private provider: WebSocketProvider | null = null;
+  private listeners: ContractListener[] = [];
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private stopped = false;
+  private reconnecting = false;
+
+  public constructor(
+    private readonly config: Config,
+    private readonly quoteProvider: JsonRpcProvider,
+    private readonly runner: EvaluationRunner,
+    private readonly notifier: BarkNotifier | null
+  ) {}
+
+  public start(): void {
+    if (!this.config.wsRpcUrl) {
+      log("websocket event listeners disabled: WS_RPC_URL not set");
+      return;
+    }
+    void this.connect("startup");
+  }
+
+  public async stop(): Promise<void> {
+    this.stopped = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    await this.cleanup();
+  }
+
+  private async connect(reason: string): Promise<void> {
+    if (this.stopped || !this.config.wsRpcUrl) return;
+
+    try {
+      const provider = new WebSocketProvider(this.config.wsRpcUrl);
+      this.provider = provider;
+      this.attachSocketHandlers(provider);
+      const listeners = [
+        startExecuteEventListener(this.config, provider, this.runner, this.notifier),
+        await startPoolEventListener(this.config, this.quoteProvider, provider, this.runner)
+      ];
+      if (this.stopped || this.provider !== provider) {
+        await Promise.all(listeners.map((listener) => listener.contract.removeAllListeners()));
+        await provider.destroy();
+        return;
+      }
+      this.listeners = listeners;
+      log(`websocket event listeners connected reason=${reason} ws=${this.config.wsRpcUrl}`);
+      this.reconnecting = false;
+    } catch (error) {
+      console.error(`[${timestamp()}] websocket listener setup failed:`, error);
+      this.scheduleReconnect("setup-failed");
+    }
+  }
+
+  private attachSocketHandlers(provider: WebSocketProvider): void {
+    const websocket = (provider as unknown as { websocket?: WebSocketLikeWithEvents }).websocket;
+    if (!websocket) {
+      log("websocket close/error hooks unavailable; periodic fallback remains active");
+      return;
+    }
+
+    const onClose = (...args: unknown[]) => {
+      log(`websocket closed details=${JSON.stringify(args)}`);
+      this.scheduleReconnect("close");
+    };
+    const onError = (error: unknown) => {
+      console.error(`[${timestamp()}] websocket error:`, error);
+      this.scheduleReconnect("error");
+    };
+
+    if (websocket.on) {
+      websocket.on("close", onClose);
+      websocket.on("error", onError);
+      return;
+    }
+
+    websocket.addEventListener?.("close", onClose);
+    websocket.addEventListener?.("error", onError);
+  }
+
+  private scheduleReconnect(reason: string): void {
+    if (this.stopped || this.reconnecting) return;
+
+    this.reconnecting = true;
+    sendNotification(this.notifier, {
+      title: "aWETH Monitor WS Reconnecting",
+      body: `Reason: ${reason}`
+    });
+    void this.cleanup().finally(() => {
+      if (this.stopped) return;
+      log(`websocket reconnect scheduled reason=${reason} delayMs=${WS_RECONNECT_DELAY_MS}`);
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectTimer = null;
+        this.reconnecting = false;
+        void this.connect(reason);
+      }, WS_RECONNECT_DELAY_MS);
+    });
+  }
+
+  private async cleanup(): Promise<void> {
+    const listeners = this.listeners;
+    const provider = this.provider;
+    this.listeners = [];
+    this.provider = null;
+
+    await Promise.all(listeners.map((listener) => listener.contract.removeAllListeners()));
+    if (provider) {
+      await provider.destroy();
+    }
+  }
 }
 
 async function main(): Promise<void> {
@@ -528,8 +642,7 @@ async function main(): Promise<void> {
   const notifier = config.barkDeviceKey
     ? new BarkNotifier(config.barkBaseUrl, config.barkDeviceKey, config.barkTitle, config.barkGroup)
     : null;
-  let executeListener: { provider: WebSocketProvider; contract: Contract } | null = null;
-  let poolListener: { provider: WebSocketProvider; contract: Contract; poolAddress: string } | null = null;
+  let wsManager: WebSocketEventManager | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
 
   const owner = getAddress(await executor.owner());
@@ -558,8 +671,8 @@ async function main(): Promise<void> {
   );
 
   const runner = new EvaluationRunner(quoteProvider, executor, config, notifier);
-  executeListener = startExecuteEventListener(config, runner, notifier);
-  poolListener = await startPoolEventListener(config, quoteProvider, runner);
+  wsManager = new WebSocketEventManager(config, quoteProvider, runner, notifier);
+  wsManager.start();
   runner.trigger("startup");
 
   if (config.intervalMs > 0) {
@@ -575,15 +688,10 @@ async function main(): Promise<void> {
     if (timer) {
       clearInterval(timer);
     }
-    await Promise.all([
-      executeListener?.contract.removeAllListeners() ?? Promise.resolve(),
-      poolListener?.contract.removeAllListeners() ?? Promise.resolve()
-    ]);
+    await wsManager?.stop();
     await Promise.all([
       quoteProvider.destroy(),
-      txProvider.destroy(),
-      executeListener?.provider.destroy() ?? Promise.resolve(),
-      poolListener?.provider.destroy() ?? Promise.resolve()
+      txProvider.destroy()
     ]);
     process.exit(0);
   };
