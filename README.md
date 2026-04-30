@@ -6,6 +6,8 @@ Default threshold is `2000` bps, meaning strictly more than 20%. The monitor run
 
 If the WebSocket connection closes or errors, the monitor tears down the old event listeners and reconnects after 5 seconds. The periodic interval continues to run as a fallback while WebSocket events are unavailable.
 
+Quote scans are batched through Multicall3. With the defaults, the coarse scan is about 4 RPC calls and the fine scan is about 2 RPC calls, while still simulating the same underlying quoter work. Pool/executor events are deduplicated by transaction hash and debounced for 2 seconds before triggering an evaluation.
+
 Set `MONITOR_INTERVAL_MS=0` to disable the periodic fallback and run from startup plus WebSocket events only.
 
 If no profitable quote exists, the monitor recommends `1 wei` instead of `0`, because `0` means unlimited on the executor contract.
@@ -54,4 +56,7 @@ It also uploads a deploy artifact containing `docker-compose.yml` and `.env.exam
 - `EXECUTOR_CONTRACT_ADDRESS`: executor proxy address.
 - `POOL_ADDRESS`: optional Uniswap V3 pool address. Leave unset to auto-resolve the WETH/aWETH pool from `POOL_FEE`.
 - `POOL_FEE`: Uniswap V3 pool fee tier, default `500`.
+- `QUOTE_BATCH_SIZE`: number of quote calls per Multicall3 request, default `20`.
+- `QUOTE_CONCURRENCY`: number of Multicall3 quote batches to run concurrently, default `6`.
+- `EVENT_DEBOUNCE_MS`: delay used to merge pool/executor events before re-evaluating, default `2000`.
 - `MONITOR_INTERVAL_MS`: monitor interval, default `600000`; set `0` to disable the interval and only evaluate on startup/events.

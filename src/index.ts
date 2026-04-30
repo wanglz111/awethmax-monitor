@@ -2,6 +2,7 @@ import "dotenv/config";
 
 import {
   Contract,
+  Interface,
   JsonRpcProvider,
   WebSocketProvider,
   Wallet,
@@ -14,6 +15,7 @@ import {
 const DEFAULT_RPC_URL = "https://arb1.arbitrum.io/rpc";
 const DEFAULT_EXECUTOR_CONTRACT_ADDRESS = "0x860Ad26c581B533016aC62152De040649208508B";
 const UNISWAP_V3_FACTORY = "0x1F98431c8aD98523631AE4a59f267346ea31F984";
+const MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11";
 const QUOTER_V2 = "0x61fFE014bA17989E743c5F6cB21bF9697530B21e";
 const WETH = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1";
 const AWETH = "0xe50fA9b3c56FfB159cB0FCA61F5c9D750e8128c8";
@@ -22,6 +24,7 @@ const MIN_SQRT_RATIO_PLUS_ONE = 4_295_128_740n;
 const SCALE_BPS = 10_000n;
 const INPUT_BUFFER_BPS = 1n;
 const WS_RECONNECT_DELAY_MS = 5_000;
+const EVENT_TX_DEDUPE_TTL_MS = 60_000;
 
 const QUOTER_ABI = [
   "function quoteExactOutputSingle((address tokenIn,address tokenOut,uint256 amount,uint24 fee,uint160 sqrtPriceLimitX96) params) returns (uint256 amountIn,uint160 sqrtPriceX96After,uint32 initializedTicksCrossed,uint256 gasEstimate)"
@@ -29,6 +32,10 @@ const QUOTER_ABI = [
 
 const FACTORY_ABI = [
   "function getPool(address tokenA,address tokenB,uint24 fee) view returns (address pool)"
+];
+
+const MULTICALL3_ABI = [
+  "function aggregate3((address target,bool allowFailure,bytes callData)[] calls) payable returns ((bool success,bytes returnData)[] returnData)"
 ];
 
 const POOL_ABI = [
@@ -72,6 +79,8 @@ type Config = {
   fineStepEth: number;
   fineWindowEth: number;
   concurrency: number;
+  quoteBatchSize: number;
+  eventDebounceMs: number;
   intervalMs: number;
   deviationBps: number;
   dryRun: boolean;
@@ -177,6 +186,8 @@ function loadConfig(): Config {
     fineStepEth: parseNumber("FINE_STEP_ETH", 0.5),
     fineWindowEth: parseNumber("FINE_WINDOW_ETH", 10),
     concurrency: parseInteger("QUOTE_CONCURRENCY", 6),
+    quoteBatchSize: parseInteger("QUOTE_BATCH_SIZE", 20),
+    eventDebounceMs: parseNonNegativeInteger("EVENT_DEBOUNCE_MS", 2_000),
     intervalMs: parseNonNegativeInteger("MONITOR_INTERVAL_MS", 600_000),
     deviationBps: parseInteger("UPDATE_DEVIATION_BPS", 2_000),
     dryRun,
@@ -202,6 +213,14 @@ function range(start: number, end: number, step: number): number[] {
     values.push(Number(value.toFixed(8)));
   }
   return values;
+}
+
+function chunk<T>(items: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
 }
 
 async function mapLimit<T, U>(items: T[], limit: number, fn: (item: T) => Promise<U>): Promise<U[]> {
@@ -287,20 +306,15 @@ function sendNotification(notifier: BarkNotifier | null, notification: BarkNotif
 }
 
 async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise<Quote> {
-  const quoter = new Contract(QUOTER_V2, QUOTER_ABI, provider);
+  const multicall = new Contract(MULTICALL3, MULTICALL3_ABI, provider);
+  const quoterInterface = new Interface(QUOTER_ABI);
 
-  async function quote(outEth: number): Promise<Quote | null> {
+  function buildQuote(outEth: number, returnData: string): Quote | null {
     const amountOut = parseEther(String(outEth));
 
     try {
       const [amountIn, sqrtPriceX96After, ticksCrossed, gasEstimate] =
-        await quoter.quoteExactOutputSingle.staticCall({
-          tokenIn: WETH,
-          tokenOut: AWETH,
-          amount: amountOut,
-          fee: config.poolFee,
-          sqrtPriceLimitX96: MIN_SQRT_RATIO_PLUS_ONE
-        });
+        quoterInterface.decodeFunctionResult("quoteExactOutputSingle", returnData);
       const maxIn = amountIn + (amountIn * INPUT_BUFFER_BPS) / SCALE_BPS;
       const bufferedProfit = amountOut - maxIn;
 
@@ -321,11 +335,46 @@ async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise
     }
   }
 
-  const coarseQuotes = await mapLimit(
-    range(config.coarseStepEth, config.maxEth, config.coarseStepEth),
-    config.concurrency,
-    quote
-  );
+  async function quoteBatch(outEthValues: number[]): Promise<Array<Quote | null>> {
+    const calls = outEthValues.map((outEth) => ({
+      target: QUOTER_V2,
+      allowFailure: true,
+      callData: quoterInterface.encodeFunctionData("quoteExactOutputSingle", [
+        {
+          tokenIn: WETH,
+          tokenOut: AWETH,
+          amount: parseEther(String(outEth)),
+          fee: config.poolFee,
+          sqrtPriceLimitX96: MIN_SQRT_RATIO_PLUS_ONE
+        }
+      ])
+    }));
+
+    try {
+      const results = await multicall.aggregate3.staticCall(calls);
+      return results.map((result: { success: boolean; returnData: string }, index: number) => {
+        if (!result.success) return null;
+        return buildQuote(outEthValues[index], result.returnData);
+      });
+    } catch {
+      if (outEthValues.length === 1) return [null];
+      const midpoint = Math.ceil(outEthValues.length / 2);
+      log(`quote multicall batch failed size=${outEthValues.length}; retrying split batches`);
+      const [left, right] = await Promise.all([
+        quoteBatch(outEthValues.slice(0, midpoint)),
+        quoteBatch(outEthValues.slice(midpoint))
+      ]);
+      return [...left, ...right];
+    }
+  }
+
+  async function quoteMany(outEthValues: number[]): Promise<Array<Quote | null>> {
+    const batches = chunk(outEthValues, config.quoteBatchSize);
+    const batchQuotes = await mapLimit(batches, config.concurrency, quoteBatch);
+    return batchQuotes.flat();
+  }
+
+  const coarseQuotes = await quoteMany(range(config.coarseStepEth, config.maxEth, config.coarseStepEth));
   const validCoarse = coarseQuotes
     .filter((item): item is Quote => item !== null)
     .filter((item) => item.sqrtPriceX96After !== MIN_SQRT_RATIO_PLUS_ONE && item.bufferedProfit > 0n)
@@ -338,11 +387,7 @@ async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise
   const center = validCoarse[0].outEth;
   const fineStart = Math.max(config.fineStepEth, center - config.fineWindowEth);
   const fineEnd = Math.min(config.maxEth, center + config.fineWindowEth);
-  const fineQuotes = await mapLimit(
-    range(fineStart, fineEnd, config.fineStepEth),
-    config.concurrency,
-    quote
-  );
+  const fineQuotes = await quoteMany(range(fineStart, fineEnd, config.fineStepEth));
   const validFine = fineQuotes
     .filter((item): item is Quote => item !== null)
     .filter((item) => item.sqrtPriceX96After !== MIN_SQRT_RATIO_PLUS_ONE && item.bufferedProfit > 0n)
@@ -407,6 +452,9 @@ async function runOnce(
 class EvaluationRunner {
   private inFlight = false;
   private queuedReason: string | null = null;
+  private eventTimer: ReturnType<typeof setTimeout> | null = null;
+  private pendingEventReason: string | null = null;
+  private readonly seenEventTxs = new Map<string, number>();
 
   public constructor(
     private readonly quoteProvider: JsonRpcProvider,
@@ -424,6 +472,47 @@ class EvaluationRunner {
 
     this.inFlight = true;
     void this.runLoop(reason);
+  }
+
+  public triggerEvent(reason: string, txHash: string | null): void {
+    this.pruneSeenEventTxs();
+    if (txHash && txHash !== "unknown") {
+      if (this.seenEventTxs.has(txHash)) {
+        log(`event ignored duplicate tx=${txHash} reason=${reason}`);
+        return;
+      }
+      this.seenEventTxs.set(txHash, Date.now() + EVENT_TX_DEDUPE_TTL_MS);
+    }
+
+    this.pendingEventReason = this.pendingEventReason ? "event-batch" : reason;
+    if (this.config.eventDebounceMs === 0) {
+      const nextReason = this.pendingEventReason;
+      this.pendingEventReason = null;
+      this.trigger(nextReason);
+      return;
+    }
+
+    if (this.eventTimer) {
+      log(`event debounced reason=${reason}`);
+      return;
+    }
+
+    log(`event scheduled reason=${reason} debounceMs=${this.config.eventDebounceMs}`);
+    this.eventTimer = setTimeout(() => {
+      this.eventTimer = null;
+      const nextReason = this.pendingEventReason ?? reason;
+      this.pendingEventReason = null;
+      this.trigger(nextReason);
+    }, this.config.eventDebounceMs);
+  }
+
+  private pruneSeenEventTxs(): void {
+    const now = Date.now();
+    for (const [txHash, expiresAt] of this.seenEventTxs) {
+      if (expiresAt <= now) {
+        this.seenEventTxs.delete(txHash);
+      }
+    }
   }
 
   private async runLoop(initialReason: string): Promise<void> {
@@ -477,7 +566,7 @@ function startExecuteEventListener(
         `Tx: ${shortHash(hash)}`
       ].join("\n")
     });
-    runner.trigger("execute-event");
+    runner.triggerEvent("execute-event", hash);
   });
 
   log("execute event listener registered");
@@ -511,7 +600,7 @@ async function startPoolEventListener(
       const hash = event?.log?.transactionHash ?? "unknown";
       const blockNumber = event?.log?.blockNumber ?? "unknown";
       log(`pool ${eventName} detected pool=${poolAddress} hash=${hash} block=${blockNumber}`);
-      runner.trigger(`pool-${eventName.toLowerCase()}`);
+      runner.triggerEvent(`pool-${eventName.toLowerCase()}`, hash);
     });
   }
 
@@ -663,6 +752,8 @@ async function main(): Promise<void> {
       `wsRpc=${config.wsRpcUrl ?? "disabled"}`,
       `poolAddress=${config.poolAddress ?? "auto"}`,
       `poolFee=${config.poolFee}`,
+      `quoteBatchSize=${config.quoteBatchSize}`,
+      `eventDebounceMs=${config.eventDebounceMs}`,
       `intervalMs=${config.intervalMs}`,
       `deviationBps=${config.deviationBps}`,
       `dryRun=${config.dryRun}`,
