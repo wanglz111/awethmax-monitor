@@ -68,6 +68,7 @@ type Quote = {
 
 type Config = {
   quoteRpcUrl: string;
+  quoteFallbackRpcUrl: string;
   txRpcUrl: string;
   wsRpcUrl: string | null;
   executorAddress: string;
@@ -174,7 +175,8 @@ function loadConfig(): Config {
   const txRpcUrl = optional("TX_RPC_URL") ?? optional("HTTP_RPC_URL") ?? optional("RPC_URL") ?? DEFAULT_RPC_URL;
 
   return {
-    quoteRpcUrl: optional("QUOTE_RPC_URL") ?? DEFAULT_RPC_URL,
+    quoteRpcUrl: DEFAULT_RPC_URL,
+    quoteFallbackRpcUrl: optional("QUOTE_FALLBACK_RPC_URL") ?? optional("QUOTE_RPC_URL") ?? txRpcUrl,
     txRpcUrl,
     wsRpcUrl: optional("WS_RPC_URL"),
     executorAddress: parseAddress("EXECUTOR_CONTRACT_ADDRESS", DEFAULT_EXECUTOR_CONTRACT_ADDRESS),
@@ -205,6 +207,23 @@ function format(value: bigint): string {
 function shortHash(hash: string): string {
   if (hash.length <= 18) return hash;
   return `${hash.slice(0, 10)}...${hash.slice(-8)}`;
+}
+
+function redactUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    const parts = url.pathname.split("/").filter(Boolean);
+    if (parts.length > 1) {
+      url.pathname = `/${parts[0]}/...`;
+    } else if (url.pathname.length > 12) {
+      url.pathname = "/...";
+    }
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return value.length > 24 ? `${value.slice(0, 24)}...` : value;
+  }
 }
 
 function range(start: number, end: number, step: number): number[] {
@@ -356,8 +375,8 @@ async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise
         if (!result.success) return null;
         return buildQuote(outEthValues[index], result.returnData);
       });
-    } catch {
-      if (outEthValues.length === 1) return [null];
+    } catch (error) {
+      if (outEthValues.length === 1) throw error;
       const midpoint = Math.ceil(outEthValues.length / 2);
       log(`quote multicall batch failed size=${outEthValues.length}; retrying split batches`);
       const [left, right] = await Promise.all([
@@ -398,11 +417,19 @@ async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise
 
 async function runOnce(
   quoteProvider: JsonRpcProvider,
+  quoteFallbackProvider: JsonRpcProvider | null,
   executor: Contract,
   config: Config,
   notifier: BarkNotifier | null
 ): Promise<void> {
-  const best = await findBestQuote(quoteProvider, config);
+  let best: Quote;
+  try {
+    best = await findBestQuote(quoteProvider, config);
+  } catch (error) {
+    if (!quoteFallbackProvider) throw error;
+    console.warn(`[${timestamp()}] public quote RPC failed; retrying with fallback RPC:`, error);
+    best = await findBestQuote(quoteFallbackProvider, config);
+  }
   const current = BigInt(await executor.maxTargetAweth());
   const shouldUpdate = overDeviationThreshold(best.amountOut, current, config.deviationBps);
 
@@ -458,6 +485,7 @@ class EvaluationRunner {
 
   public constructor(
     private readonly quoteProvider: JsonRpcProvider,
+    private readonly quoteFallbackProvider: JsonRpcProvider | null,
     private readonly executor: Contract,
     private readonly config: Config,
     private readonly notifier: BarkNotifier | null
@@ -520,7 +548,7 @@ class EvaluationRunner {
     while (reason) {
       log(`evaluation start reason=${reason}`);
       try {
-        await runOnce(this.quoteProvider, this.executor, this.config, this.notifier);
+        await runOnce(this.quoteProvider, this.quoteFallbackProvider, this.executor, this.config, this.notifier);
       } catch (error) {
         console.error(`[${timestamp()}] evaluation failed reason=${reason}:`, error);
         sendNotification(this.notifier, {
@@ -584,13 +612,28 @@ async function resolvePoolAddress(provider: JsonRpcProvider, config: Config): Pr
   return pool;
 }
 
+async function resolvePoolAddressWithFallback(
+  provider: JsonRpcProvider,
+  fallbackProvider: JsonRpcProvider | null,
+  config: Config
+): Promise<string> {
+  try {
+    return await resolvePoolAddress(provider, config);
+  } catch (error) {
+    if (!fallbackProvider) throw error;
+    console.warn(`[${timestamp()}] public RPC failed resolving pool; retrying with fallback RPC:`, error);
+    return resolvePoolAddress(fallbackProvider, config);
+  }
+}
+
 async function startPoolEventListener(
   config: Config,
   quoteProvider: JsonRpcProvider,
+  quoteFallbackProvider: JsonRpcProvider | null,
   provider: WebSocketProvider,
   runner: EvaluationRunner
 ): Promise<ContractListener> {
-  const poolAddress = await resolvePoolAddress(quoteProvider, config);
+  const poolAddress = await resolvePoolAddressWithFallback(quoteProvider, quoteFallbackProvider, config);
   const contract = new Contract(poolAddress, POOL_ABI, provider);
   const eventNames = ["Swap", "Mint", "Burn", "Collect", "Flash"] as const;
 
@@ -618,6 +661,7 @@ class WebSocketEventManager {
   public constructor(
     private readonly config: Config,
     private readonly quoteProvider: JsonRpcProvider,
+    private readonly quoteFallbackProvider: JsonRpcProvider | null,
     private readonly runner: EvaluationRunner,
     private readonly notifier: BarkNotifier | null
   ) {}
@@ -648,7 +692,13 @@ class WebSocketEventManager {
       this.attachSocketHandlers(provider);
       const listeners = [
         startExecuteEventListener(this.config, provider, this.runner, this.notifier),
-        await startPoolEventListener(this.config, this.quoteProvider, provider, this.runner)
+        await startPoolEventListener(
+          this.config,
+          this.quoteProvider,
+          this.quoteFallbackProvider,
+          provider,
+          this.runner
+        )
       ];
       if (this.stopped || this.provider !== provider) {
         await Promise.all(listeners.map((listener) => listener.contract.removeAllListeners()));
@@ -656,7 +706,7 @@ class WebSocketEventManager {
         return;
       }
       this.listeners = listeners;
-      log(`websocket event listeners connected reason=${reason} ws=${this.config.wsRpcUrl}`);
+      log(`websocket event listeners connected reason=${reason} ws=${redactUrl(this.config.wsRpcUrl)}`);
       this.reconnecting = false;
     } catch (error) {
       console.error(`[${timestamp()}] websocket listener setup failed:`, error);
@@ -725,8 +775,12 @@ class WebSocketEventManager {
 async function main(): Promise<void> {
   const config = loadConfig();
   const quoteProvider = new JsonRpcProvider(config.quoteRpcUrl, undefined, { staticNetwork: true });
+  const quoteFallbackProvider =
+    config.quoteFallbackRpcUrl === config.quoteRpcUrl
+      ? null
+      : new JsonRpcProvider(config.quoteFallbackRpcUrl, undefined, { staticNetwork: true });
   const txProvider = new JsonRpcProvider(config.txRpcUrl, undefined, { staticNetwork: true });
-  const wallet = config.privateKey ? new Wallet(config.privateKey).connect(txProvider) : null;
+  const wallet = !config.dryRun && config.privateKey ? new Wallet(config.privateKey).connect(txProvider) : null;
   const executor = new Contract(config.executorAddress, EXECUTOR_ABI, config.dryRun ? txProvider : wallet);
   const notifier = config.barkDeviceKey
     ? new BarkNotifier(config.barkBaseUrl, config.barkDeviceKey, config.barkTitle, config.barkGroup)
@@ -747,9 +801,10 @@ async function main(): Promise<void> {
       "aweth max monitor start",
       `executor=${config.executorAddress}`,
       `owner=${owner}`,
-      `quoteRpc=${config.quoteRpcUrl}`,
-      `txRpc=${config.txRpcUrl}`,
-      `wsRpc=${config.wsRpcUrl ?? "disabled"}`,
+      `quoteRpc=${redactUrl(config.quoteRpcUrl)}`,
+      `quoteFallbackRpc=${quoteFallbackProvider ? redactUrl(config.quoteFallbackRpcUrl) : "disabled"}`,
+      `txRpc=${redactUrl(config.txRpcUrl)}`,
+      `wsRpc=${config.wsRpcUrl ? redactUrl(config.wsRpcUrl) : "disabled"}`,
       `poolAddress=${config.poolAddress ?? "auto"}`,
       `poolFee=${config.poolFee}`,
       `quoteBatchSize=${config.quoteBatchSize}`,
@@ -761,8 +816,8 @@ async function main(): Promise<void> {
     ].join(" ")
   );
 
-  const runner = new EvaluationRunner(quoteProvider, executor, config, notifier);
-  wsManager = new WebSocketEventManager(config, quoteProvider, runner, notifier);
+  const runner = new EvaluationRunner(quoteProvider, quoteFallbackProvider, executor, config, notifier);
+  wsManager = new WebSocketEventManager(config, quoteProvider, quoteFallbackProvider, runner, notifier);
   wsManager.start();
   runner.trigger("startup");
 
@@ -782,6 +837,7 @@ async function main(): Promise<void> {
     await wsManager?.stop();
     await Promise.all([
       quoteProvider.destroy(),
+      quoteFallbackProvider?.destroy() ?? Promise.resolve(),
       txProvider.destroy()
     ]);
     process.exit(0);

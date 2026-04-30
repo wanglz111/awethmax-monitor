@@ -49,7 +49,8 @@ It also uploads a deploy artifact containing `docker-compose.yml` and `.env.exam
 - `OWNER_PRIVATE_KEY`: private key for the executor owner; required unless `DRY_RUN=true`.
 - `TX_RPC_URL`: reliable Arbitrum HTTP RPC URL used for owner checks and update transactions.
 - `WS_RPC_URL`: Arbitrum WebSocket RPC URL used to listen for successful executor `ArbitrageExecuted` events and Uniswap V3 pool events.
-- `QUOTE_RPC_URL`: cheaper/public Arbitrum HTTP RPC URL used for high-volume quote calls. Defaults to `https://arb1.arbitrum.io/rpc`.
+- Quote scans always try the hard-coded Arbitrum public RPC `https://arb1.arbitrum.io/rpc` first.
+- `QUOTE_FALLBACK_RPC_URL`: optional private HTTP RPC fallback for quote scans. Defaults to `QUOTE_RPC_URL` for backward compatibility, then `TX_RPC_URL`.
 - `BARK_DEVICE_KEY`: enables Bark notifications when set.
 - `BARK_TITLE`: default notification title, default `aWETH Max Monitor`.
 - `BARK_GROUP`: Bark group, default `AAVE_ARB`.
