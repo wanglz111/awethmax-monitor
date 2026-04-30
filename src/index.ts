@@ -13,15 +13,29 @@ import {
 
 const DEFAULT_RPC_URL = "https://arb1.arbitrum.io/rpc";
 const DEFAULT_EXECUTOR_CONTRACT_ADDRESS = "0x860Ad26c581B533016aC62152De040649208508B";
+const UNISWAP_V3_FACTORY = "0x1F98431c8aD98523631AE4a59f267346ea31F984";
 const QUOTER_V2 = "0x61fFE014bA17989E743c5F6cB21bF9697530B21e";
 const WETH = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1";
 const AWETH = "0xe50fA9b3c56FfB159cB0FCA61F5c9D750e8128c8";
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const MIN_SQRT_RATIO_PLUS_ONE = 4_295_128_740n;
 const SCALE_BPS = 10_000n;
 const INPUT_BUFFER_BPS = 1n;
 
 const QUOTER_ABI = [
   "function quoteExactOutputSingle((address tokenIn,address tokenOut,uint256 amount,uint24 fee,uint160 sqrtPriceLimitX96) params) returns (uint256 amountIn,uint160 sqrtPriceX96After,uint32 initializedTicksCrossed,uint256 gasEstimate)"
+];
+
+const FACTORY_ABI = [
+  "function getPool(address tokenA,address tokenB,uint24 fee) view returns (address pool)"
+];
+
+const POOL_ABI = [
+  "event Swap(address indexed sender,address indexed recipient,int256 amount0,int256 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick)",
+  "event Mint(address sender,address indexed owner,int24 indexed tickLower,int24 indexed tickUpper,uint128 amount,uint256 amount0,uint256 amount1)",
+  "event Burn(address indexed owner,int24 indexed tickLower,int24 indexed tickUpper,uint128 amount,uint256 amount0,uint256 amount1)",
+  "event Collect(address indexed owner,address recipient,int24 indexed tickLower,int24 indexed tickUpper,uint128 amount0,uint128 amount1)",
+  "event Flash(address indexed sender,address indexed recipient,uint256 amount0,uint256 amount1,uint256 paid0,uint256 paid1)"
 ];
 
 const EXECUTOR_ABI = [
@@ -49,6 +63,7 @@ type Config = {
   txRpcUrl: string;
   wsRpcUrl: string | null;
   executorAddress: string;
+  poolAddress: string | null;
   privateKey: string | null;
   poolFee: number;
   maxEth: number;
@@ -144,6 +159,7 @@ function loadConfig(): Config {
     txRpcUrl,
     wsRpcUrl: optional("WS_RPC_URL"),
     executorAddress: parseAddress("EXECUTOR_CONTRACT_ADDRESS", DEFAULT_EXECUTOR_CONTRACT_ADDRESS),
+    poolAddress: optional("POOL_ADDRESS") ? parseAddress("POOL_ADDRESS", ZERO_ADDRESS) : null,
     privateKey: dryRun ? optional("OWNER_PRIVATE_KEY") : required("OWNER_PRIVATE_KEY"),
     poolFee: parseInteger("POOL_FEE", 500),
     maxEth: parseNumber("MAX_AWETH_SCAN_ETH", 400),
@@ -463,6 +479,46 @@ function startExecuteEventListener(
   return { provider, contract };
 }
 
+async function resolvePoolAddress(provider: JsonRpcProvider, config: Config): Promise<string> {
+  if (config.poolAddress) return config.poolAddress;
+
+  const factory = new Contract(UNISWAP_V3_FACTORY, FACTORY_ABI, provider);
+  const pool = getAddress(await factory.getPool(WETH, AWETH, config.poolFee));
+  if (pool === ZERO_ADDRESS) {
+    throw new Error(`No Uniswap V3 pool found for WETH/aWETH fee=${config.poolFee}`);
+  }
+  return pool;
+}
+
+async function startPoolEventListener(
+  config: Config,
+  quoteProvider: JsonRpcProvider,
+  runner: EvaluationRunner
+): Promise<{ provider: WebSocketProvider; contract: Contract; poolAddress: string } | null> {
+  if (!config.wsRpcUrl) {
+    log("pool event listener disabled: WS_RPC_URL not set");
+    return null;
+  }
+
+  const poolAddress = await resolvePoolAddress(quoteProvider, config);
+  const provider = new WebSocketProvider(config.wsRpcUrl);
+  const contract = new Contract(poolAddress, POOL_ABI, provider);
+  const eventNames = ["Swap", "Mint", "Burn", "Collect", "Flash"] as const;
+
+  for (const eventName of eventNames) {
+    contract.on(eventName, (...args) => {
+      const event = args[args.length - 1];
+      const hash = event?.log?.transactionHash ?? "unknown";
+      const blockNumber = event?.log?.blockNumber ?? "unknown";
+      log(`pool ${eventName} detected pool=${poolAddress} hash=${hash} block=${blockNumber}`);
+      runner.trigger(`pool-${eventName.toLowerCase()}`);
+    });
+  }
+
+  log(`pool event listener start pool=${poolAddress} events=${eventNames.join(",")} ws=${config.wsRpcUrl}`);
+  return { provider, contract, poolAddress };
+}
+
 async function main(): Promise<void> {
   const config = loadConfig();
   const quoteProvider = new JsonRpcProvider(config.quoteRpcUrl, undefined, { staticNetwork: true });
@@ -473,77 +529,71 @@ async function main(): Promise<void> {
     ? new BarkNotifier(config.barkBaseUrl, config.barkDeviceKey, config.barkTitle, config.barkGroup)
     : null;
   let executeListener: { provider: WebSocketProvider; contract: Contract } | null = null;
+  let poolListener: { provider: WebSocketProvider; contract: Contract; poolAddress: string } | null = null;
+  let timer: ReturnType<typeof setInterval> | null = null;
 
-  try {
-    const owner = getAddress(await executor.owner());
-    if (!config.dryRun && !wallet) {
-      throw new Error("Missing required env var: OWNER_PRIVATE_KEY");
-    }
-    if (!config.dryRun && wallet && owner !== getAddress(wallet.address)) {
-      throw new Error(`OWNER_PRIVATE_KEY signer ${wallet.address} is not executor owner ${owner}`);
-    }
+  const owner = getAddress(await executor.owner());
+  if (!config.dryRun && !wallet) {
+    throw new Error("Missing required env var: OWNER_PRIVATE_KEY");
+  }
+  if (!config.dryRun && wallet && owner !== getAddress(wallet.address)) {
+    throw new Error(`OWNER_PRIVATE_KEY signer ${wallet.address} is not executor owner ${owner}`);
+  }
 
-    log(
-      [
-        "aweth max monitor start",
-        `executor=${config.executorAddress}`,
-        `owner=${owner}`,
-        `quoteRpc=${config.quoteRpcUrl}`,
-        `txRpc=${config.txRpcUrl}`,
-        `wsRpc=${config.wsRpcUrl ?? "disabled"}`,
-        `poolFee=${config.poolFee}`,
-        `intervalMs=${config.intervalMs}`,
-        `deviationBps=${config.deviationBps}`,
-        `dryRun=${config.dryRun}`,
-        `bark=${notifier ? "enabled" : "disabled"}`
-      ].join(" ")
-    );
+  log(
+    [
+      "aweth max monitor start",
+      `executor=${config.executorAddress}`,
+      `owner=${owner}`,
+      `quoteRpc=${config.quoteRpcUrl}`,
+      `txRpc=${config.txRpcUrl}`,
+      `wsRpc=${config.wsRpcUrl ?? "disabled"}`,
+      `poolAddress=${config.poolAddress ?? "auto"}`,
+      `poolFee=${config.poolFee}`,
+      `intervalMs=${config.intervalMs}`,
+      `deviationBps=${config.deviationBps}`,
+      `dryRun=${config.dryRun}`,
+      `bark=${notifier ? "enabled" : "disabled"}`
+    ].join(" ")
+  );
 
-    if (config.intervalMs === 0) {
-      await runOnce(quoteProvider, executor, config, notifier);
-      return;
-    }
+  const runner = new EvaluationRunner(quoteProvider, executor, config, notifier);
+  executeListener = startExecuteEventListener(config, runner, notifier);
+  poolListener = await startPoolEventListener(config, quoteProvider, runner);
+  runner.trigger("startup");
 
-    const runner = new EvaluationRunner(quoteProvider, executor, config, notifier);
-    executeListener = startExecuteEventListener(config, runner, notifier);
-    runner.trigger("startup");
-
-    const timer = setInterval(() => {
+  if (config.intervalMs > 0) {
+    timer = setInterval(() => {
       runner.trigger("interval");
     }, config.intervalMs);
-
-    const shutdown = async (signal: string) => {
-      log(`shutdown signal=${signal}`);
-      clearInterval(timer);
-      if (executeListener) {
-        await executeListener.contract.removeAllListeners();
-      }
-      await Promise.all([
-        quoteProvider.destroy(),
-        txProvider.destroy(),
-        executeListener?.provider.destroy() ?? Promise.resolve()
-      ]);
-      process.exit(0);
-    };
-
-    process.on("SIGINT", () => {
-      void shutdown("SIGINT");
-    });
-    process.on("SIGTERM", () => {
-      void shutdown("SIGTERM");
-    });
-  } finally {
-    if (config.intervalMs === 0) {
-      if (executeListener) {
-        await executeListener.contract.removeAllListeners();
-      }
-      await Promise.all([
-        quoteProvider.destroy(),
-        txProvider.destroy(),
-        executeListener?.provider.destroy() ?? Promise.resolve()
-      ]);
-    }
+  } else {
+    log("interval disabled: MONITOR_INTERVAL_MS=0");
   }
+
+  const shutdown = async (signal: string) => {
+    log(`shutdown signal=${signal}`);
+    if (timer) {
+      clearInterval(timer);
+    }
+    await Promise.all([
+      executeListener?.contract.removeAllListeners() ?? Promise.resolve(),
+      poolListener?.contract.removeAllListeners() ?? Promise.resolve()
+    ]);
+    await Promise.all([
+      quoteProvider.destroy(),
+      txProvider.destroy(),
+      executeListener?.provider.destroy() ?? Promise.resolve(),
+      poolListener?.provider.destroy() ?? Promise.resolve()
+    ]);
+    process.exit(0);
+  };
+
+  process.on("SIGINT", () => {
+    void shutdown("SIGINT");
+  });
+  process.on("SIGTERM", () => {
+    void shutdown("SIGTERM");
+  });
 }
 
 main().catch((error) => {
