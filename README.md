@@ -64,7 +64,7 @@ It also uploads a deploy artifact containing `docker-compose.yml` and `.env.exam
 - `LOW_COARSE_STEP_ETH`: low-range coarse scan step size, default `0.5`.
 - `COARSE_STEP_ETH`: high-range coarse scan step size, default `5`.
 - `FINE_STEP_ETH`: fine scan step size, default `0.1`.
-- `FINE_WINDOW_ETH`: fine scan window around the best coarse result, default `10`.
+- `FINE_WINDOW_ETH`: fine scan window around the best coarse result, default `3`.
 - `QUOTE_BATCH_SIZE`: number of quote calls per Multicall3 request, default `20`.
 - `QUOTE_CONCURRENCY`: number of Multicall3 quote batches to run concurrently, default `6`.
 - `EVENT_DEBOUNCE_MS`: delay used to merge pool/executor events before re-evaluating, default `2000`.

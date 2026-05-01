@@ -208,7 +208,7 @@ function loadConfig(): Config {
     lowCoarseStepEth: parseNumber("LOW_COARSE_STEP_ETH", 0.5),
     coarseStepEth: parseNumber("COARSE_STEP_ETH", 5),
     fineStepEth: parseNumber("FINE_STEP_ETH", 0.1),
-    fineWindowEth: parseNumber("FINE_WINDOW_ETH", 10),
+    fineWindowEth: parseNumber("FINE_WINDOW_ETH", 3),
     concurrency: parseInteger("QUOTE_CONCURRENCY", 6),
     quoteBatchSize: parseInteger("QUOTE_BATCH_SIZE", 20),
     eventDebounceMs: parseNonNegativeInteger("EVENT_DEBOUNCE_MS", 2_000),
@@ -450,8 +450,8 @@ async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise
     }
   }
 
-  async function quoteMany(outEthValues: number[]): Promise<Array<Quote | null>> {
-    const batches = config.poolFees.flatMap((fee) =>
+  async function quoteMany(outEthValues: number[], fees = config.poolFees): Promise<Array<Quote | null>> {
+    const batches = fees.flatMap((fee) =>
       chunk(outEthValues, config.quoteBatchSize).map((values) => ({ fee, values }))
     );
     const batchQuotes = await mapLimit(batches, config.concurrency, (batch) => quoteBatch(batch.fee, batch.values));
@@ -500,7 +500,8 @@ async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise
   const center = validCoarse[0].outEth;
   const fineStart = Math.max(config.fineStepEth, center - config.fineWindowEth);
   const fineEnd = Math.min(config.maxEth, center + config.fineWindowEth);
-  const fineQuotes = await quoteMany(range(fineStart, fineEnd, config.fineStepEth));
+  const fineFees = [...new Set(validCoarse.map((quote) => quote.fee))];
+  const fineQuotes = await quoteMany(range(fineStart, fineEnd, config.fineStepEth), fineFees);
   const validFine = fineQuotes
     .filter((item): item is Quote => item !== null)
     .filter((item) => item.sqrtPriceX96After !== MIN_SQRT_RATIO_PLUS_ONE && item.bufferedProfit > 0n)
