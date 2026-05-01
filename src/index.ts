@@ -23,6 +23,7 @@ const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const MIN_SQRT_RATIO_PLUS_ONE = 4_295_128_740n;
 const SCALE_BPS = 10_000n;
 const INPUT_BUFFER_BPS = 1n;
+const DEFAULT_SWAP_POOL_MIN_AWETH_RATIO_BPS = 8_000;
 const WS_RECONNECT_DELAY_MS = 5_000;
 const EVENT_TX_DEDUPE_TTL_MS = 60_000;
 
@@ -50,6 +51,8 @@ const EXECUTOR_ABI = [
   "function owner() view returns (address)",
   "function maxTargetAweth() view returns (uint256)",
   "function setMaxTargetAweth(uint256 newMaxTargetAweth)",
+  "function getSwapPools() view returns (address[] pools,uint24[] fees)",
+  "function setSwapPools(address[] pools,uint24[] fees)",
   "event ArbitrageExecuted(uint256 flashAmount,uint256 wethSpent,uint256 profit,uint256 kairosPayment,address indexed caller,address indexed profitRecipient)"
 ];
 
@@ -65,6 +68,18 @@ type Quote = {
   sqrtPriceX96After: bigint;
   ticksCrossed: number;
   gasEstimate: number;
+};
+
+type PoolDecision = {
+  fee: number;
+  quote: Quote | null;
+  keep: boolean;
+  reason: "best" | "within-ratio" | "below-ratio" | "no-profitable-quote";
+};
+
+type QuoteEvaluation = {
+  best: Quote;
+  poolDecisions: PoolDecision[];
 };
 
 type Config = {
@@ -85,6 +100,7 @@ type Config = {
   fineWindowEth: number;
   concurrency: number;
   quoteBatchSize: number;
+  swapPoolMinAwethRatioBps: number;
   eventDebounceMs: number;
   intervalMs: number;
   deviationBps: number;
@@ -179,6 +195,14 @@ function parseNonNegativeInteger(name: string, fallback: number): number {
   return parsed;
 }
 
+function parseBps(name: string, fallback: number): number {
+  const parsed = parseNonNegativeInteger(name, fallback);
+  if (parsed > Number(SCALE_BPS)) {
+    throw new Error(`Invalid bps value in ${name}: ${parsed}`);
+  }
+  return parsed;
+}
+
 function parseAddress(name: string, fallback: string): string {
   const value = optional(name) ?? fallback;
   if (!isAddress(value)) {
@@ -211,6 +235,7 @@ function loadConfig(): Config {
     fineWindowEth: parseNumber("FINE_WINDOW_ETH", 3),
     concurrency: parseInteger("QUOTE_CONCURRENCY", 6),
     quoteBatchSize: parseInteger("QUOTE_BATCH_SIZE", 20),
+    swapPoolMinAwethRatioBps: parseBps("SWAP_POOL_MIN_AWETH_RATIO_BPS", DEFAULT_SWAP_POOL_MIN_AWETH_RATIO_BPS),
     eventDebounceMs: parseNonNegativeInteger("EVENT_DEBOUNCE_MS", 2_000),
     intervalMs: parseNonNegativeInteger("MONITOR_INTERVAL_MS", 600_000),
     deviationBps: parseInteger("UPDATE_DEVIATION_BPS", 2_000),
@@ -318,6 +343,51 @@ function fallbackQuote(): Quote {
   };
 }
 
+function bestQuoteByProfit(quotes: Quote[]): Quote | null {
+  return [...quotes].sort((a, b) => (a.bufferedProfit < b.bufferedProfit ? 1 : -1))[0] ?? null;
+}
+
+function buildPoolDecisions(config: Config, quotes: Quote[], bestQuote?: Quote): PoolDecision[] {
+  const best = bestQuote ?? bestQuoteByProfit(quotes);
+  if (!best) {
+    return config.poolFees.map((fee) => ({
+      fee,
+      quote: null,
+      keep: false,
+      reason: "no-profitable-quote"
+    }));
+  }
+
+  return config.poolFees.map((fee) => {
+    const quote = bestQuoteByProfit(quotes.filter((item) => item.fee === fee));
+    if (!quote) {
+      return {
+        fee,
+        quote,
+        keep: false,
+        reason: "no-profitable-quote"
+      };
+    }
+
+    if (fee === best.fee) {
+      return {
+        fee,
+        quote,
+        keep: true,
+        reason: "best"
+      };
+    }
+
+    const keep = quote.amountOut * SCALE_BPS >= best.amountOut * BigInt(config.swapPoolMinAwethRatioBps);
+    return {
+      fee,
+      quote,
+      keep,
+      reason: keep ? "within-ratio" : "below-ratio"
+    };
+  });
+}
+
 class BarkNotifier {
   private readonly endpoint: string;
 
@@ -357,7 +427,7 @@ function sendNotification(notifier: BarkNotifier | null, notification: BarkNotif
   void notifier.send(notification);
 }
 
-async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise<Quote> {
+async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise<QuoteEvaluation> {
   const multicall = new Contract(MULTICALL3, MULTICALL3_ABI, provider);
   const quoter = new Contract(QUOTER_V2, QUOTER_ABI, provider);
   const quoterInterface = new Interface(QUOTER_ABI);
@@ -484,7 +554,10 @@ async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise
   const validLowCoarse = validQuotes(lowCoarseQuotes);
 
   if (validLowCoarse.length === 0) {
-    return fallbackQuote();
+    return {
+      best: fallbackQuote(),
+      poolDecisions: buildPoolDecisions(config, [])
+    };
   }
 
   const highCoarseStart = Math.max(config.coarseStepEth, lowCoarseEnd + config.coarseStepEth);
@@ -494,7 +567,10 @@ async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise
   );
 
   if (validCoarse.length === 0) {
-    return fallbackQuote();
+    return {
+      best: fallbackQuote(),
+      poolDecisions: buildPoolDecisions(config, [])
+    };
   }
 
   const center = validCoarse[0].outEth;
@@ -507,7 +583,76 @@ async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise
     .filter((item) => item.sqrtPriceX96After !== MIN_SQRT_RATIO_PLUS_ONE && item.bufferedProfit > 0n)
     .sort((a, b) => (a.bufferedProfit < b.bufferedProfit ? 1 : -1));
 
-  return validFine[0] ?? validCoarse[0];
+  const validQuotesForDecision = validFine.length > 0 ? [...validCoarse, ...validFine] : validCoarse;
+  const best = bestQuoteByProfit(validFine) ?? validCoarse[0];
+
+  return {
+    best,
+    poolDecisions: buildPoolDecisions(config, validQuotesForDecision, best)
+  };
+}
+
+function sameFeeList(left: number[], right: number[]): boolean {
+  return left.length === right.length && left.every((fee, index) => fee === right[index]);
+}
+
+function formatPoolDecisions(decisions: PoolDecision[]): string {
+  return decisions
+    .map((decision) => {
+      const aweth = decision.quote ? format(decision.quote.amountOut) : "0.000000";
+      return `${decision.fee}:${decision.keep ? "keep" : "remove"}:${decision.reason}:aweth=${aweth}`;
+    })
+    .join(",");
+}
+
+async function resolveSwapPoolAddressForFee(
+  quoteProvider: JsonRpcProvider,
+  quoteFallbackProvider: JsonRpcProvider | null,
+  config: Config,
+  fee: number
+): Promise<string> {
+  if (config.poolAddress && config.poolFees.length === 1) {
+    return config.poolAddress;
+  }
+  return resolvePoolAddressForFee(quoteProvider, quoteFallbackProvider, config, fee);
+}
+
+async function syncSwapPools(
+  quoteProvider: JsonRpcProvider,
+  quoteFallbackProvider: JsonRpcProvider | null,
+  executor: Contract,
+  config: Config,
+  decisions: PoolDecision[]
+): Promise<void> {
+  const targetFees = decisions.filter((decision) => decision.keep).map((decision) => decision.fee);
+  if (targetFees.length === 0) {
+    log("swapPools update skipped: no profitable pool can be kept");
+    return;
+  }
+
+  const [, currentFeesRaw] = await executor.getSwapPools();
+  const currentFees = Array.from(currentFeesRaw as Iterable<bigint | number>).map((fee) => Number(fee));
+  if (sameFeeList(currentFees, targetFees)) {
+    log(`swapPools unchanged fees=${targetFees.join(",")}`);
+    return;
+  }
+
+  const targetPools = await Promise.all(
+    targetFees.map((fee) => resolveSwapPoolAddressForFee(quoteProvider, quoteFallbackProvider, config, fee))
+  );
+
+  if (config.dryRun) {
+    log(`dry-run skip setSwapPools(pools=[${targetPools.join(",")}], fees=[${targetFees.join(",")}])`);
+    return;
+  }
+
+  const tx = await executor.setSwapPools(targetPools, targetFees);
+  log(`setSwapPools sent hash=${tx.hash} fees=${targetFees.join(",")}`);
+  const receipt = await tx.wait(1);
+  if (!receipt || receipt.status !== 1) {
+    throw new Error(`setSwapPools failed hash=${tx.hash}`);
+  }
+  log(`setSwapPools confirmed block=${receipt.blockNumber} fees=${targetFees.join(",")}`);
 }
 
 async function runOnce(
@@ -517,13 +662,14 @@ async function runOnce(
   config: Config,
   notifier: BarkNotifier | null
 ): Promise<void> {
-  let best: Quote;
+  let evaluation: QuoteEvaluation;
   try {
-    best = await findBestQuote(quoteProvider, config);
+    evaluation = await findBestQuote(quoteProvider, config);
   } catch (error) {
     if (!quoteFallbackProvider) throw error;
-    best = await findBestQuote(quoteFallbackProvider, config);
+    evaluation = await findBestQuote(quoteFallbackProvider, config);
   }
+  const { best, poolDecisions } = evaluation;
   const current = BigInt(await executor.maxTargetAweth());
   const shouldUpdate = overDeviationThreshold(best.amountOut, current, config.deviationBps);
 
@@ -539,9 +685,12 @@ async function runOnce(
       `profitBps=${best.profitBps.toString()}`,
       `ticks=${best.ticksCrossed}`,
       `quoteGas=${best.gasEstimate}`,
+      `poolDecisions=${formatPoolDecisions(poolDecisions)}`,
       `update=${shouldUpdate}`
     ].join(" ")
   );
+
+  await syncSwapPools(quoteProvider, quoteFallbackProvider, executor, config, poolDecisions);
 
   if (!shouldUpdate) return;
 
@@ -964,6 +1113,7 @@ async function main(): Promise<void> {
       `poolAddress=${config.poolAddress ?? "auto"}`,
       `poolFees=${config.poolFees.join(",")}`,
       `quoteBatchSize=${config.quoteBatchSize}`,
+      `swapPoolMinAwethRatioBps=${config.swapPoolMinAwethRatioBps}`,
       `eventDebounceMs=${config.eventDebounceMs}`,
       `intervalMs=${config.intervalMs}`,
       `deviationBps=${config.deviationBps}`,

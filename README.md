@@ -8,6 +8,8 @@ If the WebSocket connection closes or errors, the monitor tears down the old eve
 
 Quote scans are batched through Multicall3. With the defaults, the monitor first scans `0.5` aWETH steps through `5` aWETH. If that low range has no profitable quote, the evaluation stops there. If the low range is profitable, each fee tier continues with `5` aWETH steps above that and stops at the first high-range batch with no profitable quotes; the fine scan then uses `0.1` aWETH steps around the best coarse result and is about 11 RPC calls per configured fee. If a public RPC rejects a Multicall3 batch, that batch is retried as single quoter calls without logging noisy split-batch warnings. Pool/executor events are deduplicated by transaction hash and debounced for 2 seconds before triggering an evaluation.
 
+After each evaluation, the monitor also syncs the executor swap pool list through `setSwapPools(address[],uint24[])`. A configured fee tier is kept only if it has a profitable quote and its recommended aWETH target is at least `SWAP_POOL_MIN_AWETH_RATIO_BPS` of the best fee tier. The default is `8000` bps, so a 100/500 fee pool that is below 80% of the best pool, or has no profitable quote, is removed from the executor pool list.
+
 Set `MONITOR_INTERVAL_MS=0` to disable the periodic fallback and run from startup plus WebSocket events only.
 
 If no profitable quote exists, the monitor recommends `1 wei` instead of `0`, because `0` means unlimited on the executor contract.
@@ -20,7 +22,8 @@ Create `.env` in the same directory as `docker-compose.yml`:
 OWNER_PRIVATE_KEY=0xYOUR_EXECUTOR_OWNER_PRIVATE_KEY
 TX_RPC_URL=https://arb-mainnet.g.alchemy.com/v2/YOUR_KEY
 WS_RPC_URL=wss://arb-mainnet.g.alchemy.com/v2/YOUR_KEY
-POOL_FEES=100,500
+POOL_FEES=100,500,3000
+SWAP_POOL_MIN_AWETH_RATIO_BPS=8000
 
 BARK_BASE_URL=https://api.day.app
 BARK_DEVICE_KEY=YOUR_BARK_DEVICE_KEY
@@ -57,7 +60,7 @@ It also uploads a deploy artifact containing `docker-compose.yml` and `.env.exam
 - `BARK_GROUP`: Bark group, default `AAVE_ARB`.
 - `EXECUTOR_CONTRACT_ADDRESS`: executor proxy address.
 - `POOL_ADDRESS`: optional Uniswap V3 pool address. Leave unset to auto-resolve the WETH/aWETH pools from `POOL_FEES`.
-- `POOL_FEES`: comma-separated Uniswap V3 pool fee tiers to scan and listen to, for example `100,500`.
+- `POOL_FEES`: comma-separated Uniswap V3 pool fee tiers to scan and listen to, for example `100,500,3000`.
 - `POOL_FEE`: backward-compatible single fee tier, default `500`, used only when `POOL_FEES` is unset.
 - `MAX_AWETH_SCAN_ETH`: maximum aWETH output to scan, default `400`.
 - `LOW_COARSE_MAX_ETH`: upper bound for low-range coarse scans, default `5`.
@@ -67,5 +70,6 @@ It also uploads a deploy artifact containing `docker-compose.yml` and `.env.exam
 - `FINE_WINDOW_ETH`: fine scan window around the best coarse result, default `3`.
 - `QUOTE_BATCH_SIZE`: number of quote calls per Multicall3 request, default `20`.
 - `QUOTE_CONCURRENCY`: number of Multicall3 quote batches to run concurrently, default `6`.
+- `SWAP_POOL_MIN_AWETH_RATIO_BPS`: minimum per-pool aWETH target ratio versus the best pool before that pool remains enabled through `setSwapPools`, default `8000`.
 - `EVENT_DEBOUNCE_MS`: delay used to merge pool/executor events before re-evaluating, default `2000`.
 - `MONITOR_INTERVAL_MS`: monitor interval, default `600000`; set `0` to disable the interval and only evaluate on startup/events.
