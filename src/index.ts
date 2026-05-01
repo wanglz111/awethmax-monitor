@@ -78,6 +78,8 @@ type Config = {
   poolFee: number;
   poolFees: number[];
   maxEth: number;
+  lowCoarseMaxEth: number;
+  lowCoarseStepEth: number;
   coarseStepEth: number;
   fineStepEth: number;
   fineWindowEth: number;
@@ -202,8 +204,10 @@ function loadConfig(): Config {
     poolFee,
     poolFees: poolFees.length > 0 ? poolFees : [poolFee],
     maxEth: parseNumber("MAX_AWETH_SCAN_ETH", 400),
+    lowCoarseMaxEth: parseNumber("LOW_COARSE_MAX_ETH", 5),
+    lowCoarseStepEth: parseNumber("LOW_COARSE_STEP_ETH", 0.5),
     coarseStepEth: parseNumber("COARSE_STEP_ETH", 5),
-    fineStepEth: parseNumber("FINE_STEP_ETH", 0.5),
+    fineStepEth: parseNumber("FINE_STEP_ETH", 0.1),
     fineWindowEth: parseNumber("FINE_WINDOW_ETH", 10),
     concurrency: parseInteger("QUOTE_CONCURRENCY", 6),
     quoteBatchSize: parseInteger("QUOTE_BATCH_SIZE", 20),
@@ -250,6 +254,10 @@ function range(start: number, end: number, step: number): number[] {
     values.push(Number(value.toFixed(8)));
   }
   return values;
+}
+
+function uniqueSorted(values: number[]): number[] {
+  return [...new Set(values)].sort((a, b) => a - b);
 }
 
 function chunk<T>(items: T[], size: number): T[][] {
@@ -454,7 +462,13 @@ async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise
     return batchQuotes.flat();
   }
 
-  const coarseQuotes = await quoteMany(range(config.coarseStepEth, config.maxEth, config.coarseStepEth));
+  const lowCoarseEnd = Math.min(config.lowCoarseMaxEth, config.maxEth);
+  const highCoarseStart = Math.max(config.coarseStepEth, lowCoarseEnd + config.coarseStepEth);
+  const coarseValues = uniqueSorted([
+    ...range(config.lowCoarseStepEth, lowCoarseEnd, config.lowCoarseStepEth),
+    ...range(highCoarseStart, config.maxEth, config.coarseStepEth)
+  ]);
+  const coarseQuotes = await quoteMany(coarseValues);
   const validCoarse = coarseQuotes
     .filter((item): item is Quote => item !== null)
     .filter((item) => item.sqrtPriceX96After !== MIN_SQRT_RATIO_PLUS_ONE && item.bufferedProfit > 0n)

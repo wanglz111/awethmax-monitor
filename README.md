@@ -6,7 +6,7 @@ Default threshold is `2000` bps, meaning strictly more than 20%. The monitor run
 
 If the WebSocket connection closes or errors, the monitor tears down the old event listeners and reconnects after 5 seconds. The periodic interval continues to run as a fallback while WebSocket events are unavailable.
 
-Quote scans are batched through Multicall3. With the defaults, the coarse scan is about 4 RPC calls and the fine scan is about 2 RPC calls, while still simulating the same underlying quoter work. If a public RPC rejects a Multicall3 batch, that batch is retried as single quoter calls without logging noisy split-batch warnings. Pool/executor events are deduplicated by transaction hash and debounced for 2 seconds before triggering an evaluation.
+Quote scans are batched through Multicall3. With the defaults, the coarse scan uses `0.5` aWETH steps through `5` aWETH, then `5` aWETH steps above that, for about 5 RPC calls per configured fee; the fine scan uses `0.1` aWETH steps around the best coarse result and is about 11 RPC calls per configured fee. If a public RPC rejects a Multicall3 batch, that batch is retried as single quoter calls without logging noisy split-batch warnings. Pool/executor events are deduplicated by transaction hash and debounced for 2 seconds before triggering an evaluation.
 
 Set `MONITOR_INTERVAL_MS=0` to disable the periodic fallback and run from startup plus WebSocket events only.
 
@@ -59,6 +59,12 @@ It also uploads a deploy artifact containing `docker-compose.yml` and `.env.exam
 - `POOL_ADDRESS`: optional Uniswap V3 pool address. Leave unset to auto-resolve the WETH/aWETH pools from `POOL_FEES`.
 - `POOL_FEES`: comma-separated Uniswap V3 pool fee tiers to scan and listen to, for example `100,500`.
 - `POOL_FEE`: backward-compatible single fee tier, default `500`, used only when `POOL_FEES` is unset.
+- `MAX_AWETH_SCAN_ETH`: maximum aWETH output to scan, default `400`.
+- `LOW_COARSE_MAX_ETH`: upper bound for low-range coarse scans, default `5`.
+- `LOW_COARSE_STEP_ETH`: low-range coarse scan step size, default `0.5`.
+- `COARSE_STEP_ETH`: high-range coarse scan step size, default `5`.
+- `FINE_STEP_ETH`: fine scan step size, default `0.1`.
+- `FINE_WINDOW_ETH`: fine scan window around the best coarse result, default `10`.
 - `QUOTE_BATCH_SIZE`: number of quote calls per Multicall3 request, default `20`.
 - `QUOTE_CONCURRENCY`: number of Multicall3 quote batches to run concurrently, default `6`.
 - `EVENT_DEBOUNCE_MS`: delay used to merge pool/executor events before re-evaluating, default `2000`.
