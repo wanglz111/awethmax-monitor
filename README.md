@@ -6,7 +6,7 @@ Default threshold is `2000` bps, meaning strictly more than 20%. The monitor run
 
 If the WebSocket connection closes or errors, the monitor tears down the old event listeners and reconnects after 5 seconds. The periodic interval continues to run as a fallback while WebSocket events are unavailable.
 
-Quote scans are batched through Multicall3. With the defaults, the coarse scan uses `0.5` aWETH steps through `5` aWETH, then `5` aWETH steps above that, for about 5 RPC calls per configured fee; the fine scan uses `0.1` aWETH steps around the best coarse result and is about 11 RPC calls per configured fee. If a public RPC rejects a Multicall3 batch, that batch is retried as single quoter calls without logging noisy split-batch warnings. Pool/executor events are deduplicated by transaction hash and debounced for 2 seconds before triggering an evaluation.
+Quote scans are batched through Multicall3. With the defaults, the monitor first scans `0.5` aWETH steps through `5` aWETH. If that low range has no profitable quote, the evaluation stops there. If the low range is profitable, each fee tier continues with `5` aWETH steps above that and stops at the first high-range batch with no profitable quotes; the fine scan then uses `0.1` aWETH steps around the best coarse result and is about 11 RPC calls per configured fee. If a public RPC rejects a Multicall3 batch, that batch is retried as single quoter calls without logging noisy split-batch warnings. Pool/executor events are deduplicated by transaction hash and debounced for 2 seconds before triggering an evaluation.
 
 Set `MONITOR_INTERVAL_MS=0` to disable the periodic fallback and run from startup plus WebSocket events only.
 

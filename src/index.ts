@@ -256,10 +256,6 @@ function range(start: number, end: number, step: number): number[] {
   return values;
 }
 
-function uniqueSorted(values: number[]): number[] {
-  return [...new Set(values)].sort((a, b) => a - b);
-}
-
 function chunk<T>(items: T[], size: number): T[][] {
   const chunks: T[][] = [];
   for (let index = 0; index < items.length; index += size) {
@@ -462,17 +458,40 @@ async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise
     return batchQuotes.flat();
   }
 
+  const validQuotes = (quotes: Array<Quote | null>): Quote[] =>
+    quotes
+      .filter((item): item is Quote => item !== null)
+      .filter((item) => item.sqrtPriceX96After !== MIN_SQRT_RATIO_PLUS_ONE && item.bufferedProfit > 0n)
+      .sort((a, b) => (a.bufferedProfit < b.bufferedProfit ? 1 : -1));
+
+  async function quoteCoarseUntilUnprofitable(outEthValues: number[]): Promise<Quote[]> {
+    const feeQuotes = await mapLimit(config.poolFees, config.concurrency, async (fee) => {
+      const quotes: Quote[] = [];
+      for (const values of chunk(outEthValues, config.quoteBatchSize)) {
+        const validBatch = validQuotes(await quoteBatch(fee, values));
+        if (validBatch.length === 0) {
+          break;
+        }
+        quotes.push(...validBatch);
+      }
+      return quotes;
+    });
+    return feeQuotes.flat();
+  }
+
   const lowCoarseEnd = Math.min(config.lowCoarseMaxEth, config.maxEth);
+  const lowCoarseQuotes = await quoteMany(range(config.lowCoarseStepEth, lowCoarseEnd, config.lowCoarseStepEth));
+  const validLowCoarse = validQuotes(lowCoarseQuotes);
+
+  if (validLowCoarse.length === 0) {
+    return fallbackQuote();
+  }
+
   const highCoarseStart = Math.max(config.coarseStepEth, lowCoarseEnd + config.coarseStepEth);
-  const coarseValues = uniqueSorted([
-    ...range(config.lowCoarseStepEth, lowCoarseEnd, config.lowCoarseStepEth),
-    ...range(highCoarseStart, config.maxEth, config.coarseStepEth)
-  ]);
-  const coarseQuotes = await quoteMany(coarseValues);
-  const validCoarse = coarseQuotes
-    .filter((item): item is Quote => item !== null)
-    .filter((item) => item.sqrtPriceX96After !== MIN_SQRT_RATIO_PLUS_ONE && item.bufferedProfit > 0n)
-    .sort((a, b) => (a.bufferedProfit < b.bufferedProfit ? 1 : -1));
+  const validHighCoarse = await quoteCoarseUntilUnprofitable(range(highCoarseStart, config.maxEth, config.coarseStepEth));
+  const validCoarse = [...validLowCoarse, ...validHighCoarse].sort((a, b) =>
+    a.bufferedProfit < b.bufferedProfit ? 1 : -1
+  );
 
   if (validCoarse.length === 0) {
     return fallbackQuote();
