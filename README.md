@@ -6,7 +6,7 @@ Default threshold is `2000` bps, meaning strictly more than 20%. The monitor run
 
 If the WebSocket connection closes or errors, the monitor tears down the old event listeners and reconnects after 5 seconds. The periodic interval continues to run as a fallback while WebSocket events are unavailable.
 
-Quote scans are batched through Multicall3. With the defaults, the monitor first scans `0.5` aWETH steps through `5` aWETH. If that low range has no profitable quote, the evaluation stops there. If the low range is profitable, each fee tier continues with `5` aWETH steps above that and stops at the first high-range batch with no profitable quotes; the fine scan then uses `0.1` aWETH steps around the best coarse result and is about 11 RPC calls per configured fee. If a public RPC rejects a Multicall3 batch, that batch is retried as single quoter calls without logging noisy split-batch warnings. Pool/executor events are deduplicated by transaction hash and debounced for 2 seconds before triggering an evaluation.
+Quote scans are batched through Multicall3. With the defaults, the monitor first scans `0.5` aWETH steps through `5` aWETH. If that low range has no profitable quote, the evaluation stops there. Fee tiers with no profitable low-range quote are skipped for the high-range scan; active fee tiers continue with `5` aWETH steps above that and stop at the first high-range batch with no profitable quotes. The fine scan then uses `0.1` aWETH steps around the best coarse result. With `QUOTE_BATCH_SIZE=80`, the default single-fee scan is about 3 quote RPC calls. If a quote RPC rejects a Multicall3 batch, that batch is split and retried recursively before falling back to single quoter calls. Pool/executor events are deduplicated by transaction hash and debounced for 2 seconds before triggering an evaluation.
 
 After each evaluation, the monitor also syncs the executor swap pool list through `setSwapPools(address[],uint24[])`. A configured fee tier is kept only if it has a profitable quote and its recommended aWETH target is at least `SWAP_POOL_MIN_AWETH_RATIO_BPS` of the best fee tier. The default is `8000` bps, so a 100/500 fee pool that is below 80% of the best pool, or has no profitable quote, is removed from the executor pool list.
 
@@ -22,6 +22,7 @@ Create `.env` in the same directory as `docker-compose.yml`:
 OWNER_PRIVATE_KEY=0xYOUR_EXECUTOR_OWNER_PRIVATE_KEY
 TX_RPC_URL=https://arb-mainnet.g.alchemy.com/v2/YOUR_KEY
 WS_RPC_URL=wss://arb-mainnet.g.alchemy.com/v2/YOUR_KEY
+QUOTE_RPC_URL=https://arbitrum.blockpi.network/v1/rpc/YOUR_BLOCKPI_KEY
 POOL_FEES=100,500,3000
 SWAP_POOL_MIN_AWETH_RATIO_BPS=8000
 
@@ -53,8 +54,8 @@ It also uploads a deploy artifact containing `docker-compose.yml` and `.env.exam
 - `OWNER_PRIVATE_KEY`: private key for the executor owner; required unless `DRY_RUN=true`.
 - `TX_RPC_URL`: reliable Arbitrum HTTP RPC URL used for owner checks and update transactions.
 - `WS_RPC_URL`: Arbitrum WebSocket RPC URL used to listen for successful executor `ArbitrageExecuted` events and Uniswap V3 pool events.
-- Quote scans always try the hard-coded Arbitrum public RPC `https://arb1.arbitrum.io/rpc` first.
-- `QUOTE_FALLBACK_RPC_URL`: optional private HTTP RPC fallback for quote scans. Defaults to `QUOTE_RPC_URL` for backward compatibility, then `TX_RPC_URL`.
+- `QUOTE_RPC_URL`: Arbitrum HTTP RPC URL used for quote scans. Defaults to `https://arb1.arbitrum.io/rpc`.
+- `QUOTE_FALLBACK_RPC_URL`: optional HTTP RPC fallback for quote scans. Defaults to `TX_RPC_URL` when different from `QUOTE_RPC_URL`.
 - `BARK_DEVICE_KEY`: enables Bark notifications when set.
 - `BARK_TITLE`: default notification title, default `aWETH Max Monitor`.
 - `BARK_GROUP`: Bark group, default `AAVE_ARB`.
@@ -68,7 +69,7 @@ It also uploads a deploy artifact containing `docker-compose.yml` and `.env.exam
 - `COARSE_STEP_ETH`: high-range coarse scan step size, default `5`.
 - `FINE_STEP_ETH`: fine scan step size, default `0.1`.
 - `FINE_WINDOW_ETH`: fine scan window around the best coarse result, default `3`.
-- `QUOTE_BATCH_SIZE`: number of quote calls per Multicall3 request, default `20`.
+- `QUOTE_BATCH_SIZE`: number of quote calls per Multicall3 request, default `80`.
 - `QUOTE_CONCURRENCY`: number of Multicall3 quote batches to run concurrently, default `6`.
 - `SWAP_POOL_MIN_AWETH_RATIO_BPS`: minimum per-pool aWETH target ratio versus the best pool before that pool remains enabled through `setSwapPools`, default `8000`.
 - `EVENT_DEBOUNCE_MS`: delay used to merge pool/executor events before re-evaluating, default `2000`.

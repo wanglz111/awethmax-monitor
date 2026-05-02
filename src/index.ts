@@ -214,12 +214,13 @@ function parseAddress(name: string, fallback: string): string {
 function loadConfig(): Config {
   const dryRun = parseBool("DRY_RUN", false);
   const txRpcUrl = optional("TX_RPC_URL") ?? optional("HTTP_RPC_URL") ?? optional("RPC_URL") ?? DEFAULT_RPC_URL;
+  const quoteRpcUrl = optional("QUOTE_RPC_URL") ?? DEFAULT_RPC_URL;
   const poolFee = parseInteger("POOL_FEE", 500);
   const poolFees = parseIntegerList("POOL_FEES");
 
   return {
-    quoteRpcUrl: DEFAULT_RPC_URL,
-    quoteFallbackRpcUrl: optional("QUOTE_FALLBACK_RPC_URL") ?? optional("QUOTE_RPC_URL") ?? txRpcUrl,
+    quoteRpcUrl,
+    quoteFallbackRpcUrl: optional("QUOTE_FALLBACK_RPC_URL") ?? (quoteRpcUrl === txRpcUrl ? quoteRpcUrl : txRpcUrl),
     txRpcUrl,
     wsRpcUrl: optional("WS_RPC_URL"),
     executorAddress: parseAddress("EXECUTOR_CONTRACT_ADDRESS", DEFAULT_EXECUTOR_CONTRACT_ADDRESS),
@@ -234,7 +235,7 @@ function loadConfig(): Config {
     fineStepEth: parseNumber("FINE_STEP_ETH", 0.1),
     fineWindowEth: parseNumber("FINE_WINDOW_ETH", 3),
     concurrency: parseInteger("QUOTE_CONCURRENCY", 6),
-    quoteBatchSize: parseInteger("QUOTE_BATCH_SIZE", 20),
+    quoteBatchSize: parseInteger("QUOTE_BATCH_SIZE", 80),
     swapPoolMinAwethRatioBps: parseBps("SWAP_POOL_MIN_AWETH_RATIO_BPS", DEFAULT_SWAP_POOL_MIN_AWETH_RATIO_BPS),
     eventDebounceMs: parseNonNegativeInteger("EVENT_DEBOUNCE_MS", 2_000),
     intervalMs: parseNonNegativeInteger("MONITOR_INTERVAL_MS", 600_000),
@@ -511,7 +512,15 @@ async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise
         return buildQuote(fee, outEthValues[index], result.returnData);
       });
     } catch (error) {
-      return quoteSingles(fee, outEthValues);
+      if (outEthValues.length <= 2) {
+        return quoteSingles(fee, outEthValues);
+      }
+      const midpoint = Math.ceil(outEthValues.length / 2);
+      const [left, right] = await Promise.all([
+        quoteBatch(fee, outEthValues.slice(0, midpoint)),
+        quoteBatch(fee, outEthValues.slice(midpoint))
+      ]);
+      return [...left, ...right];
     }
   }
 
@@ -529,8 +538,8 @@ async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise
       .filter((item) => item.sqrtPriceX96After !== MIN_SQRT_RATIO_PLUS_ONE && item.bufferedProfit > 0n)
       .sort((a, b) => (a.bufferedProfit < b.bufferedProfit ? 1 : -1));
 
-  async function quoteCoarseUntilUnprofitable(outEthValues: number[]): Promise<Quote[]> {
-    const feeQuotes = await mapLimit(config.poolFees, config.concurrency, async (fee) => {
+  async function quoteCoarseUntilUnprofitable(outEthValues: number[], fees: number[]): Promise<Quote[]> {
+    const feeQuotes = await mapLimit(fees, config.concurrency, async (fee) => {
       const quotes: Quote[] = [];
       for (const values of chunk(outEthValues, config.quoteBatchSize)) {
         const validBatch = validQuotes(await quoteBatch(fee, values));
@@ -555,8 +564,12 @@ async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise
     };
   }
 
+  const activeFees = [...new Set(validLowCoarse.map((quote) => quote.fee))];
   const highCoarseStart = Math.max(config.coarseStepEth, lowCoarseEnd + config.coarseStepEth);
-  const validHighCoarse = await quoteCoarseUntilUnprofitable(range(highCoarseStart, config.maxEth, config.coarseStepEth));
+  const validHighCoarse = await quoteCoarseUntilUnprofitable(
+    range(highCoarseStart, config.maxEth, config.coarseStepEth),
+    activeFees
+  );
   const validCoarse = [...validLowCoarse, ...validHighCoarse].sort((a, b) =>
     a.bufferedProfit < b.bufferedProfit ? 1 : -1
   );
