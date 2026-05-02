@@ -251,11 +251,6 @@ function format(value: bigint): string {
   return Number(formatEther(value)).toFixed(6);
 }
 
-function shortHash(hash: string): string {
-  if (hash.length <= 18) return hash;
-  return `${hash.slice(0, 10)}...${hash.slice(-8)}`;
-}
-
 function redactUrl(value: string): string {
   try {
     const url = new URL(value);
@@ -715,8 +710,7 @@ async function runOnce(
       `Fee: ${best.fee}`,
       `Reason: ${best.reason}`,
       `Delta: ${deviationBps(best.amountOut, current)} bps`,
-      `Tx: ${shortHash(tx.hash)}`,
-      `Block: ${receipt.blockNumber}`
+      `Max buffer profit: ${format(best.bufferedProfit)} WETH`
     ].join("\n")
   });
 }
@@ -835,8 +829,7 @@ function startExecuteEventListener(
       body: [
         `Profit: ${format(BigInt(profit))} WETH`,
         `Flash: ${format(BigInt(flashAmount))} WETH`,
-        `Spent: ${format(BigInt(wethSpent))} WETH`,
-        `Tx: ${shortHash(hash)}`
+        `Spent: ${format(BigInt(wethSpent))} WETH`
       ].join("\n")
     });
     runner.triggerEvent("execute-event", hash);
