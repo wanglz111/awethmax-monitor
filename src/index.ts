@@ -1,5 +1,7 @@
 import "dotenv/config";
 
+import { createRequire } from "node:module";
+import type { FeeAmount } from "@uniswap/v3-sdk";
 import {
   Contract,
   Interface,
@@ -11,6 +13,10 @@ import {
   isAddress,
   parseEther
 } from "ethers";
+
+const require = createRequire(import.meta.url);
+const { CurrencyAmount, Token } = require("@uniswap/sdk-core") as typeof import("@uniswap/sdk-core");
+const { Pool } = require("@uniswap/v3-sdk") as typeof import("@uniswap/v3-sdk");
 
 const DEFAULT_RPC_URL = "https://arb1.arbitrum.io/rpc";
 const DEFAULT_EXECUTOR_CONTRACT_ADDRESS = "0x860Ad26c581B533016aC62152De040649208508B";
@@ -40,6 +46,10 @@ const MULTICALL3_ABI = [
 ];
 
 const POOL_ABI = [
+  "function slot0() view returns (uint160 sqrtPriceX96,int24 tick,uint16 observationIndex,uint16 observationCardinality,uint16 observationCardinalityNext,uint8 feeProtocol,bool unlocked)",
+  "function liquidity() view returns (uint128)",
+  "function tickBitmap(int16 wordPosition) view returns (uint256)",
+  "function ticks(int24 tick) view returns (uint128 liquidityGross,int128 liquidityNet,uint256 feeGrowthOutside0X128,uint256 feeGrowthOutside1X128,int56 tickCumulativeOutside,uint160 secondsPerLiquidityOutsideX128,uint32 secondsOutside,bool initialized)",
   "event Swap(address indexed sender,address indexed recipient,int256 amount0,int256 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick)",
   "event Mint(address sender,address indexed owner,int24 indexed tickLower,int24 indexed tickUpper,uint128 amount,uint256 amount0,uint256 amount1)",
   "event Burn(address indexed owner,int24 indexed tickLower,int24 indexed tickUpper,uint128 amount,uint256 amount0,uint256 amount1)",
@@ -100,6 +110,7 @@ type Config = {
   fineWindowEth: number;
   concurrency: number;
   quoteBatchSize: number;
+  localQuoteShadow: boolean;
   swapPoolMinAwethRatioBps: number;
   eventDebounceMs: number;
   intervalMs: number;
@@ -131,6 +142,10 @@ function timestamp(): string {
 
 function log(message: string): void {
   console.log(`[${timestamp()}] ${message}`);
+}
+
+function elapsedMs(startedAt: number): string {
+  return (performance.now() - startedAt).toFixed(1);
 }
 
 function optional(name: string): string | null {
@@ -236,6 +251,7 @@ function loadConfig(): Config {
     fineWindowEth: parseNumber("FINE_WINDOW_ETH", 3),
     concurrency: parseInteger("QUOTE_CONCURRENCY", 6),
     quoteBatchSize: parseInteger("QUOTE_BATCH_SIZE", 80),
+    localQuoteShadow: parseBool("LOCAL_QUOTE_SHADOW", false),
     swapPoolMinAwethRatioBps: parseBps("SWAP_POOL_MIN_AWETH_RATIO_BPS", DEFAULT_SWAP_POOL_MIN_AWETH_RATIO_BPS),
     eventDebounceMs: parseNonNegativeInteger("EVENT_DEBOUNCE_MS", 2_000),
     intervalMs: parseNonNegativeInteger("MONITOR_INTERVAL_MS", 600_000),
@@ -341,6 +357,91 @@ function fallbackQuote(): Quote {
 
 function bestQuoteByProfit(quotes: Quote[]): Quote | null {
   return [...quotes].sort((a, b) => (a.bufferedProfit < b.bufferedProfit ? 1 : -1))[0] ?? null;
+}
+
+const ARBITRUM_CHAIN_ID = 42_161;
+const WETH_TOKEN = new Token(ARBITRUM_CHAIN_ID, WETH, 18, "WETH", "Wrapped Ether");
+const AWETH_TOKEN = new Token(ARBITRUM_CHAIN_ID, AWETH, 18, "aWETH", "Aave Arbitrum WETH");
+const MAX_UINT_256 = (1n << 256n) - 1n;
+
+function floorDiv(left: number, right: number): number {
+  return Math.floor(left / right);
+}
+
+function positiveMod(left: number, right: number): number {
+  return ((left % right) + right) % right;
+}
+
+function mostSignificantBit(value: bigint): number {
+  if (value <= 0n) throw new Error("mostSignificantBit requires a positive value");
+  return value.toString(2).length - 1;
+}
+
+function leastSignificantBit(value: bigint): number {
+  if (value <= 0n) throw new Error("leastSignificantBit requires a positive value");
+  let bit = 0;
+  let cursor = value;
+  while ((cursor & 1n) === 0n) {
+    cursor >>= 1n;
+    bit += 1;
+  }
+  return bit;
+}
+
+class RpcTickDataProvider {
+  private readonly bitmapCache = new Map<number, bigint>();
+  private readonly tickCache = new Map<number, { liquidityNet: string }>();
+
+  public constructor(private readonly pool: Contract) {}
+
+  public async getTick(tick: number): Promise<{ liquidityNet: string }> {
+    const cached = this.tickCache.get(tick);
+    if (cached) return cached;
+
+    const [, liquidityNet] = await this.pool.ticks(tick);
+    const value = { liquidityNet: BigInt(liquidityNet).toString() };
+    this.tickCache.set(tick, value);
+    return value;
+  }
+
+  public async nextInitializedTickWithinOneWord(
+    tick: number,
+    lte: boolean,
+    tickSpacing: number
+  ): Promise<[number, boolean]> {
+    if (lte) {
+      const compressed = floorDiv(tick, tickSpacing);
+      const wordPosition = compressed >> 8;
+      const bitPosition = positiveMod(compressed, 256);
+      const mask = (1n << BigInt(bitPosition + 1)) - 1n;
+      const masked = (await this.tickBitmap(wordPosition)) & mask;
+
+      if (masked !== 0n) {
+        return [(compressed - (bitPosition - mostSignificantBit(masked))) * tickSpacing, true];
+      }
+      return [(compressed - bitPosition) * tickSpacing, false];
+    }
+
+    const compressed = floorDiv(tick, tickSpacing) + 1;
+    const wordPosition = compressed >> 8;
+    const bitPosition = positiveMod(compressed, 256);
+    const mask = MAX_UINT_256 ^ ((1n << BigInt(bitPosition)) - 1n);
+    const masked = (await this.tickBitmap(wordPosition)) & mask;
+
+    if (masked !== 0n) {
+      return [(compressed + (leastSignificantBit(masked) - bitPosition)) * tickSpacing, true];
+    }
+    return [(compressed + (255 - bitPosition)) * tickSpacing, false];
+  }
+
+  private async tickBitmap(wordPosition: number): Promise<bigint> {
+    const cached = this.bitmapCache.get(wordPosition);
+    if (cached !== undefined) return cached;
+
+    const bitmap = BigInt(await this.pool.tickBitmap(wordPosition));
+    this.bitmapCache.set(wordPosition, bitmap);
+    return bitmap;
+  }
 }
 
 function buildPoolDecisions(config: Config, quotes: Quote[], bestQuote?: Quote): PoolDecision[] {
@@ -663,6 +764,63 @@ async function syncSwapPools(
   log(`setSwapPools confirmed block=${receipt.blockNumber} fees=${targetFees.join(",")}`);
 }
 
+async function compareLocalQuoteShadow(
+  provider: JsonRpcProvider,
+  fallbackProvider: JsonRpcProvider | null,
+  config: Config,
+  quote: Quote
+): Promise<void> {
+  const startedAt = performance.now();
+  try {
+    if (quote.reason !== "profitable-quote" || quote.fee === 0) return;
+
+    const storageStartedAt = performance.now();
+    const poolAddress = await resolvePoolAddressForFee(provider, fallbackProvider, config, quote.fee);
+    const poolContract = new Contract(poolAddress, POOL_ABI, provider);
+    const [slot0, liquidity] = await Promise.all([poolContract.slot0(), poolContract.liquidity()]);
+    const storageMs = elapsedMs(storageStartedAt);
+
+    const localComputeStartedAt = performance.now();
+    const tickDataProvider = new RpcTickDataProvider(poolContract);
+    const pool = new Pool(
+      WETH_TOKEN,
+      AWETH_TOKEN,
+      quote.fee as FeeAmount,
+      BigInt(slot0.sqrtPriceX96).toString(),
+      BigInt(liquidity).toString(),
+      Number(slot0.tick),
+      tickDataProvider
+    );
+    const output = CurrencyAmount.fromRawAmount(AWETH_TOKEN, quote.amountOut.toString());
+    const [input] = await pool.getInputAmount(output);
+    const localAmountIn = BigInt(input.quotient.toString());
+    const localMaxIn = localAmountIn + (localAmountIn * INPUT_BUFFER_BPS) / SCALE_BPS;
+    const localBufferedProfit = quote.amountOut - localMaxIn;
+    const amountInDiff = localAmountIn - quote.amountIn;
+    const bufferedProfitDiff = localBufferedProfit - quote.bufferedProfit;
+    const localComputeMs = elapsedMs(localComputeStartedAt);
+
+    log(
+      [
+        "localQuoteShadow",
+        `totalMs=${elapsedMs(startedAt)}`,
+        `storageMs=${storageMs}`,
+        `localComputeMs=${localComputeMs}`,
+        `fee=${quote.fee}`,
+        `target=${format(quote.amountOut)}aWETH`,
+        `rpcAmountIn=${format(quote.amountIn)}WETH`,
+        `localAmountIn=${format(localAmountIn)}WETH`,
+        `amountInDiffWei=${amountInDiff.toString()}`,
+        `rpcBufferedProfit=${format(quote.bufferedProfit)}WETH`,
+        `localBufferedProfit=${format(localBufferedProfit)}WETH`,
+        `bufferedProfitDiffWei=${bufferedProfitDiff.toString()}`
+      ].join(" ")
+    );
+  } catch (error) {
+    console.warn(`[${timestamp()}] localQuoteShadow failed:`, error);
+  }
+}
+
 async function runOnce(
   quoteProvider: JsonRpcProvider,
   quoteFallbackProvider: JsonRpcProvider | null,
@@ -671,10 +829,12 @@ async function runOnce(
   notifier: BarkNotifier | null
 ): Promise<void> {
   let evaluation: QuoteEvaluation;
+  let evaluationProvider = quoteProvider;
   try {
     evaluation = await findBestQuote(quoteProvider, config);
   } catch (error) {
     if (!quoteFallbackProvider) throw error;
+    evaluationProvider = quoteFallbackProvider;
     evaluation = await findBestQuote(quoteFallbackProvider, config);
   }
   const { best, poolDecisions } = evaluation;
@@ -697,6 +857,10 @@ async function runOnce(
       `update=${shouldUpdate}`
     ].join(" ")
   );
+
+  if (config.localQuoteShadow) {
+    void compareLocalQuoteShadow(evaluationProvider, quoteFallbackProvider, config, best);
+  }
 
   await syncSwapPools(quoteProvider, quoteFallbackProvider, executor, config, poolDecisions);
 
@@ -1119,6 +1283,7 @@ async function main(): Promise<void> {
       `poolAddress=${config.poolAddress ?? "auto"}`,
       `poolFees=${config.poolFees.join(",")}`,
       `quoteBatchSize=${config.quoteBatchSize}`,
+      `localQuoteShadow=${config.localQuoteShadow}`,
       `swapPoolMinAwethRatioBps=${config.swapPoolMinAwethRatioBps}`,
       `eventDebounceMs=${config.eventDebounceMs}`,
       `intervalMs=${config.intervalMs}`,

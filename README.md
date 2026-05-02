@@ -71,6 +71,7 @@ It also uploads a deploy artifact containing `docker-compose.yml` and `.env.exam
 - `FINE_WINDOW_ETH`: fine scan window around the best coarse result, default `3`.
 - `QUOTE_BATCH_SIZE`: number of quote calls per Multicall3 request, default `80`.
 - `QUOTE_CONCURRENCY`: number of Multicall3 quote batches to run concurrently, default `6`.
+- `LOCAL_QUOTE_SHADOW`: enable non-invasive local Uniswap V3 SDK quote comparison logs, default `false`.
 - `SWAP_POOL_MIN_AWETH_RATIO_BPS`: minimum per-pool aWETH target ratio versus the best pool before that pool remains enabled through `setSwapPools`, default `8000`.
 - `EVENT_DEBOUNCE_MS`: delay used to merge pool/executor events before re-evaluating, default `2000`.
 - `MONITOR_INTERVAL_MS`: monitor interval, default `600000`; set `0` to disable the interval and only evaluate on startup/events.
