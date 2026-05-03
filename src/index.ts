@@ -874,6 +874,11 @@ function totalBufferedProfit(decisions: PoolDecision[]): bigint {
   return decisions.reduce((total, decision) => total + (decision.quote?.bufferedProfit ?? 0n), 0n);
 }
 
+function eventFee(reason: string): number | null {
+  const match = /^pool-(\d+)-/.exec(reason);
+  return match ? Number(match[1]) : null;
+}
+
 function logEvaluation(source: string, evaluation: QuoteEvaluation, config: Config): void {
   const { best, poolDecisions } = evaluation;
   log(
@@ -1055,8 +1060,10 @@ async function runOnce(
 class EvaluationRunner {
   private inFlight = false;
   private queuedReason: string | null = null;
+  private queuedEventFees = new Set<number>();
   private eventTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingEventReason: string | null = null;
+  private pendingEventFees = new Set<number>();
   private lastEvaluation: QuoteEvaluation | null = null;
   private readonly seenEventTxs = new Map<string, number>();
 
@@ -1068,15 +1075,18 @@ class EvaluationRunner {
     private readonly notifier: BarkNotifier | null
   ) {}
 
-  public trigger(reason: string): void {
+  public trigger(reason: string, eventFees = new Set<number>()): void {
     if (this.inFlight) {
       this.queuedReason = reason;
+      for (const fee of eventFees) {
+        this.queuedEventFees.add(fee);
+      }
       log(`evaluation queued reason=${reason}`);
       return;
     }
 
     this.inFlight = true;
-    void this.runLoop(reason);
+    void this.runLoop(reason, eventFees);
   }
 
   public triggerEvent(reason: string, txHash: string | null): void {
@@ -1089,11 +1099,18 @@ class EvaluationRunner {
       this.seenEventTxs.set(txHash, Date.now() + EVENT_TX_DEDUPE_TTL_MS);
     }
 
+    const fee = eventFee(reason);
+    if (fee !== null) {
+      this.pendingEventFees.add(fee);
+    }
+
     this.pendingEventReason = this.pendingEventReason ? "event-batch" : reason;
     if (this.config.eventDebounceMs === 0) {
       const nextReason = this.pendingEventReason;
+      const nextEventFees = this.pendingEventFees;
       this.pendingEventReason = null;
-      this.trigger(nextReason);
+      this.pendingEventFees = new Set();
+      this.trigger(nextReason, nextEventFees);
       return;
     }
 
@@ -1106,8 +1123,10 @@ class EvaluationRunner {
     this.eventTimer = setTimeout(() => {
       this.eventTimer = null;
       const nextReason = this.pendingEventReason ?? reason;
+      const nextEventFees = this.pendingEventFees;
       this.pendingEventReason = null;
-      this.trigger(nextReason);
+      this.pendingEventFees = new Set();
+      this.trigger(nextReason, nextEventFees);
     }, this.config.eventDebounceMs);
   }
 
@@ -1120,15 +1139,29 @@ class EvaluationRunner {
     }
   }
 
-  private async runLoop(initialReason: string): Promise<void> {
+  private seedEvaluationFor(reason: string, eventFees: Set<number>): QuoteEvaluation | null {
+    if (reason === "startup" || reason === "interval" || !this.lastEvaluation) {
+      return null;
+    }
+
+    for (const fee of eventFees) {
+      const decision = this.lastEvaluation.poolDecisions.find((item) => item.fee === fee);
+      if (!decision?.quote) {
+        log(`seeded scan disabled reason=${reason} fee=${fee} previousQuote=none`);
+        return null;
+      }
+    }
+
+    return this.lastEvaluation;
+  }
+
+  private async runLoop(initialReason: string, initialEventFees: Set<number>): Promise<void> {
     let reason: string | null = initialReason;
+    let eventFees = initialEventFees;
     while (reason) {
       log(`evaluation start reason=${reason}`);
       try {
-        const seedEvaluation =
-          reason === "startup" || reason === "interval"
-            ? null
-            : this.lastEvaluation;
+        const seedEvaluation = this.seedEvaluationFor(reason, eventFees);
         this.lastEvaluation = await runOnce(
           this.quoteProvider,
           this.quoteFallbackProvider,
@@ -1145,7 +1178,9 @@ class EvaluationRunner {
         });
       }
       reason = this.queuedReason;
+      eventFees = this.queuedEventFees;
       this.queuedReason = null;
+      this.queuedEventFees = new Set();
     }
     this.inFlight = false;
   }
