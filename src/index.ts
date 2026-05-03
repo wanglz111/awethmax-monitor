@@ -1406,10 +1406,7 @@ async function runOnce(
     void compareLocalQuoteShadow(evaluationProvider, quoteFallbackProvider, config, evaluation.best);
   }
 
-  const updated = await syncSwapPools(quoteProvider, quoteFallbackProvider, executor, config, evaluation.poolDecisions);
-  if (updated) {
-    sendCapsUpdatedNotification(notifier, evaluation);
-  }
+  await syncSwapPools(quoteProvider, quoteFallbackProvider, executor, config, evaluation.poolDecisions);
   return evaluation;
 }
 
@@ -1781,10 +1778,6 @@ class WebSocketEventManager {
     if (this.stopped || this.reconnecting) return;
 
     this.reconnecting = true;
-    sendNotification(this.notifier, {
-      title: "aWETH Monitor WS Reconnecting",
-      body: `Reason: ${reason}`
-    });
     void this.cleanup().finally(() => {
       if (this.stopped) return;
       log(`websocket reconnect scheduled reason=${reason} delayMs=${WS_RECONNECT_DELAY_MS}`);
