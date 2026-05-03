@@ -17,6 +17,7 @@ import {
 const require = createRequire(import.meta.url);
 const { CurrencyAmount, Token } = require("@uniswap/sdk-core") as typeof import("@uniswap/sdk-core");
 const { Pool } = require("@uniswap/v3-sdk") as typeof import("@uniswap/v3-sdk");
+const JSBI = require("jsbi") as { BigInt: (value: string) => unknown };
 
 const DEFAULT_RPC_URL = "https://arb1.arbitrum.io/rpc";
 const DEFAULT_EXECUTOR_CONTRACT_ADDRESS = "0x860Ad26c581B533016aC62152De040649208508B";
@@ -28,6 +29,10 @@ const AWETH = "0xe50fA9b3c56FfB159cB0FCA61F5c9D750e8128c8";
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const MIN_SQRT_RATIO_PLUS_ONE = 4_295_128_740n;
 const SCALE_BPS = 10_000n;
+const LOCAL_REFINE_STEP_WEI = 100_000_000_000_000n;
+const LOCAL_REFINE_WINDOW_WEI = 50_000_000_000_000_000n;
+const LOCAL_VERIFY_STEP_WEI = LOCAL_REFINE_STEP_WEI;
+const LOCAL_VERIFY_RADIUS_STEPS = 2n;
 const DEFAULT_SWAP_POOL_MIN_AWETH_RATIO_BPS = 0;
 const WS_RECONNECT_DELAY_MS = 5_000;
 const EVENT_TX_DEDUPE_TTL_MS = 60_000;
@@ -118,6 +123,7 @@ type Config = {
   fineWindowEth: number;
   concurrency: number;
   quoteBatchSize: number;
+  localQuoteTimeoutMs: number;
   localQuoteShadow: boolean;
   swapPoolMinAwethRatioBps: number;
   eventDebounceMs: number;
@@ -259,6 +265,7 @@ function loadConfig(): Config {
     fineWindowEth: parseNumber("FINE_WINDOW_ETH", 3),
     concurrency: parseInteger("QUOTE_CONCURRENCY", 6),
     quoteBatchSize: parseInteger("QUOTE_BATCH_SIZE", 80),
+    localQuoteTimeoutMs: parseNonNegativeInteger("LOCAL_QUOTE_TIMEOUT_MS", 120_000),
     localQuoteShadow: parseBool("LOCAL_QUOTE_SHADOW", false),
     swapPoolMinAwethRatioBps: parseBps("SWAP_POOL_MIN_AWETH_RATIO_BPS", DEFAULT_SWAP_POOL_MIN_AWETH_RATIO_BPS),
     eventDebounceMs: parseNonNegativeInteger("EVENT_DEBOUNCE_MS", 2_000),
@@ -323,6 +330,25 @@ async function mapLimit<T, U>(items: T[], limit: number, fn: (item: T) => Promis
 
   await Promise.all(Array.from({ length: limit }, worker));
   return output;
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  if (timeoutMs === 0) return promise;
+
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 function overDeviationThreshold(next: bigint, current: bigint, thresholdBps: number): boolean {
@@ -393,17 +419,34 @@ function leastSignificantBit(value: bigint): number {
 class RpcTickDataProvider {
   private readonly bitmapCache = new Map<number, bigint>();
   private readonly tickCache = new Map<number, { liquidityNet: string }>();
+  private readonly bitmapInflight = new Map<number, Promise<bigint>>();
+  private readonly tickInflight = new Map<number, Promise<{ liquidityNet: string }>>();
 
-  public constructor(private readonly pool: Contract) {}
+  public constructor(
+    private readonly pool: Contract,
+    private readonly blockTag?: number
+  ) {}
 
   public async getTick(tick: number): Promise<{ liquidityNet: string }> {
     const cached = this.tickCache.get(tick);
     if (cached) return cached;
 
-    const [, liquidityNet] = await this.pool.ticks(tick);
-    const value = { liquidityNet: BigInt(liquidityNet).toString() };
-    this.tickCache.set(tick, value);
-    return value;
+    const inflight = this.tickInflight.get(tick);
+    if (inflight) return inflight;
+
+    const request = this.pool
+      .ticks(tick, this.callOverrides())
+      .then((result) => {
+        const [, liquidityNet] = result;
+        const value = { liquidityNet: BigInt(liquidityNet).toString() };
+        this.tickCache.set(tick, value);
+        return value;
+      })
+      .finally(() => {
+        this.tickInflight.delete(tick);
+      });
+    this.tickInflight.set(tick, request);
+    return request;
   }
 
   public async nextInitializedTickWithinOneWord(
@@ -440,9 +483,25 @@ class RpcTickDataProvider {
     const cached = this.bitmapCache.get(wordPosition);
     if (cached !== undefined) return cached;
 
-    const bitmap = BigInt(await this.pool.tickBitmap(wordPosition));
-    this.bitmapCache.set(wordPosition, bitmap);
-    return bitmap;
+    const inflight = this.bitmapInflight.get(wordPosition);
+    if (inflight) return inflight;
+
+    const request = this.pool
+      .tickBitmap(wordPosition, this.callOverrides())
+      .then((result) => {
+        const bitmap = BigInt(result);
+        this.bitmapCache.set(wordPosition, bitmap);
+        return bitmap;
+      })
+      .finally(() => {
+        this.bitmapInflight.delete(wordPosition);
+      });
+    this.bitmapInflight.set(wordPosition, request);
+    return request;
+  }
+
+  private callOverrides(): { blockTag?: number } {
+    return this.blockTag === undefined ? {} : { blockTag: this.blockTag };
   }
 }
 
@@ -540,6 +599,18 @@ function buildQuoteFromInput(
   gasEstimate: bigint
 ): Quote {
   const amountOut = parseEther(String(outEth));
+  return buildQuoteFromRaw(fee, outEth, amountOut, amountIn, sqrtPriceX96After, ticksCrossed, gasEstimate);
+}
+
+function buildQuoteFromRaw(
+  fee: number,
+  outEth: number,
+  amountOut: bigint,
+  amountIn: bigint,
+  sqrtPriceX96After: bigint,
+  ticksCrossed: bigint,
+  gasEstimate: bigint
+): Quote {
   const maxIn = amountIn;
   const bufferedProfit = amountOut - maxIn;
 
@@ -665,6 +736,274 @@ async function scanSeededBestQuote(
   return {
     best,
     poolDecisions: buildPoolDecisions(config, quotes, best)
+  };
+}
+
+type LocalQuoteContext = {
+  fee: number;
+  pool: typeof Pool.prototype;
+};
+
+function amountOutToEthNumber(amountOut: bigint): number {
+  return Number(formatEther(amountOut));
+}
+
+function quoteParamsRaw(fee: number, amountOut: bigint) {
+  return {
+    tokenIn: WETH,
+    tokenOut: AWETH,
+    amount: amountOut,
+    fee,
+    sqrtPriceLimitX96: MIN_SQRT_RATIO_PLUS_ONE
+  };
+}
+
+async function buildLocalQuoteContexts(
+  provider: JsonRpcProvider,
+  fallbackProvider: JsonRpcProvider | null,
+  config: Config,
+  blockTag: number
+): Promise<Map<number, LocalQuoteContext>> {
+  const entries = await Promise.all(
+    config.poolFees.map(async (fee) => {
+      const poolAddress = await resolvePoolAddressForFee(provider, fallbackProvider, config, fee);
+      const poolContract = new Contract(poolAddress, POOL_ABI, provider);
+      const overrides = { blockTag };
+      const [slot0, liquidity] = await Promise.all([
+        poolContract.slot0(overrides),
+        poolContract.liquidity(overrides)
+      ]);
+      const tickDataProvider = new RpcTickDataProvider(poolContract, blockTag);
+      const pool = new Pool(
+        WETH_TOKEN,
+        AWETH_TOKEN,
+        fee as FeeAmount,
+        BigInt(slot0.sqrtPriceX96).toString(),
+        BigInt(liquidity).toString(),
+        Number(slot0.tick),
+        tickDataProvider
+      );
+      return [fee, { fee, pool }] as const;
+    })
+  );
+  return new Map(entries);
+}
+
+function localVerificationAmountOuts(center: bigint, maxAmountOut: bigint): bigint[] {
+  const values: bigint[] = [];
+  for (let offset = -LOCAL_VERIFY_RADIUS_STEPS; offset <= LOCAL_VERIFY_RADIUS_STEPS; offset += 1n) {
+    const amountOut = center + offset * LOCAL_VERIFY_STEP_WEI;
+    if (amountOut > 0n && amountOut <= maxAmountOut) {
+      values.push(amountOut);
+    }
+  }
+  return [...new Set(values)].sort((a, b) => (a < b ? -1 : 1));
+}
+
+async function verifyLocalEvaluationWithEthCall(
+  provider: JsonRpcProvider,
+  config: Config,
+  evaluation: QuoteEvaluation,
+  blockTag: number
+): Promise<QuoteEvaluation> {
+  const quoter = new Contract(QUOTER_V2, QUOTER_ABI, provider);
+  const multicall = new Contract(MULTICALL3, MULTICALL3_ABI, provider);
+  const quoterInterface = new Interface(QUOTER_ABI);
+  const maxAmountOut = parseEther(String(config.maxEth));
+  const candidates = evaluation.poolDecisions
+    .map((decision) => decision.quote)
+    .filter((quote): quote is Quote => quote !== null)
+    .flatMap((quote) =>
+      localVerificationAmountOuts(quote.amountOut, maxAmountOut).map((amountOut) => ({ fee: quote.fee, amountOut }))
+    );
+  const uniqueCandidates = [...new Map(candidates.map((item) => [`${item.fee}:${item.amountOut}`, item])).values()];
+
+  if (uniqueCandidates.length === 0) {
+    return {
+      best: fallbackQuote(),
+      poolDecisions: buildPoolDecisions(config, [])
+    };
+  }
+
+  function buildQuote(fee: number, amountOut: bigint, returnData: string): Quote | null {
+    try {
+      const [amountIn, sqrtPriceX96After, ticksCrossed, gasEstimate] =
+        quoterInterface.decodeFunctionResult("quoteExactOutputSingle", returnData);
+      return buildQuoteFromRaw(
+        fee,
+        amountOutToEthNumber(amountOut),
+        amountOut,
+        amountIn,
+        sqrtPriceX96After,
+        ticksCrossed,
+        gasEstimate
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  async function quoteSingle(fee: number, amountOut: bigint): Promise<Quote | null> {
+    try {
+      const [amountIn, sqrtPriceX96After, ticksCrossed, gasEstimate] =
+        await quoter.quoteExactOutputSingle.staticCall(quoteParamsRaw(fee, amountOut), { blockTag });
+      return buildQuoteFromRaw(
+        fee,
+        amountOutToEthNumber(amountOut),
+        amountOut,
+        amountIn,
+        sqrtPriceX96After,
+        ticksCrossed,
+        gasEstimate
+      );
+    } catch (error) {
+      if (!isQuoteRevert(error)) throw error;
+      return null;
+    }
+  }
+
+  const calls = uniqueCandidates.map(({ fee, amountOut }) => ({
+    target: QUOTER_V2,
+    allowFailure: true,
+    callData: quoterInterface.encodeFunctionData("quoteExactOutputSingle", [quoteParamsRaw(fee, amountOut)])
+  }));
+
+  let quotes: Array<Quote | null>;
+  try {
+    const results = await multicall.aggregate3.staticCall(calls, { blockTag });
+    quotes = results.map((result: { success: boolean; returnData: string }, index: number) => {
+      if (!result.success) return null;
+      const candidate = uniqueCandidates[index];
+      return buildQuote(candidate.fee, candidate.amountOut, result.returnData);
+    });
+  } catch {
+    quotes = await mapLimit(uniqueCandidates, config.concurrency, (candidate) =>
+      quoteSingle(candidate.fee, candidate.amountOut)
+    );
+  }
+
+  const verifiedQuotes = validQuotes(quotes);
+  const best = bestQuoteByProfit(verifiedQuotes);
+  return {
+    best: best ?? fallbackQuote(),
+    poolDecisions: buildPoolDecisions(config, verifiedQuotes, best ?? undefined)
+  };
+}
+
+async function refineLocalQuote(
+  config: Config,
+  center: Quote,
+  localQuoteRaw: (fee: number, amountOut: bigint) => Promise<Quote | null>
+): Promise<Quote | null> {
+  const maxIndex = parseEther(String(config.maxEth)) / LOCAL_REFINE_STEP_WEI;
+  const centerIndex = center.amountOut / LOCAL_REFINE_STEP_WEI;
+  const windowSteps = LOCAL_REFINE_WINDOW_WEI / LOCAL_REFINE_STEP_WEI;
+  let low = centerIndex > windowSteps ? centerIndex - windowSteps : 1n;
+  let high = centerIndex + windowSteps < maxIndex ? centerIndex + windowSteps : maxIndex;
+  const cache = new Map<string, Quote | null>();
+
+  async function quoteAt(index: bigint): Promise<Quote | null> {
+    const key = index.toString();
+    if (cache.has(key)) return cache.get(key) ?? null;
+    const quote = await localQuoteRaw(center.fee, index * LOCAL_REFINE_STEP_WEI);
+    cache.set(key, quote);
+    return quote;
+  }
+
+  async function profitAt(index: bigint): Promise<bigint> {
+    const quote = await quoteAt(index);
+    return quote && quote.sqrtPriceX96After !== MIN_SQRT_RATIO_PLUS_ONE ? quote.bufferedProfit : -1n;
+  }
+
+  while (high - low > 6n) {
+    const third = (high - low) / 3n;
+    const midLeft = low + third;
+    const midRight = high - third;
+    const [leftProfit, rightProfit] = await Promise.all([profitAt(midLeft), profitAt(midRight)]);
+    if (leftProfit < rightProfit) {
+      low = midLeft + 1n;
+    } else {
+      high = midRight - 1n;
+    }
+  }
+
+  const candidates: Quote[] = [];
+  for (let index = low; index <= high; index += 1n) {
+    const quote = await quoteAt(index);
+    if (quote) candidates.push(quote);
+  }
+  return bestQuoteByProfit(validQuotes(candidates));
+}
+
+async function findBestLocalVerifiedQuote(
+  provider: JsonRpcProvider,
+  fallbackProvider: JsonRpcProvider | null,
+  config: Config,
+  seedEvaluation: QuoteEvaluation | null = null
+): Promise<QuoteRun> {
+  const startedAt = performance.now();
+  const ethCallStartedAt = performance.now();
+  const baseRun = await findBestEthCallQuote(provider, config, seedEvaluation);
+  log(
+    `hybrid eth_call center scan completed seeded=${baseRun.seeded} elapsedMs=${elapsedMs(ethCallStartedAt)}`
+  );
+
+  const blockTag = await provider.getBlockNumber();
+  log(`hybrid local refine block pinned block=${blockTag}`);
+  const contexts = await buildLocalQuoteContexts(provider, fallbackProvider, config, blockTag);
+  log(`hybrid local contexts ready block=${blockTag} elapsedMs=${elapsedMs(startedAt)}`);
+  const sqrtPriceLimitX96 = JSBI.BigInt(MIN_SQRT_RATIO_PLUS_ONE.toString());
+
+  async function localQuoteRaw(fee: number, amountOut: bigint): Promise<Quote | null> {
+    const context = contexts.get(fee);
+    if (!context) return null;
+
+    try {
+      const output = CurrencyAmount.fromRawAmount(AWETH_TOKEN, amountOut.toString());
+      const [input, nextPool] = await context.pool.getInputAmount(output, sqrtPriceLimitX96 as never);
+      return buildQuoteFromRaw(
+        fee,
+        amountOutToEthNumber(amountOut),
+        amountOut,
+        BigInt(input.quotient.toString()),
+        BigInt(nextPool.sqrtRatioX96.toString()),
+        0n,
+        0n
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  const refineStartedAt = performance.now();
+  const refinedQuotes = (
+    await mapLimit(
+      baseRun.evaluation.poolDecisions
+        .map((decision) => decision.quote)
+        .filter((quote): quote is Quote => quote !== null),
+      config.concurrency,
+      async (quote) => refineLocalQuote(config, quote, localQuoteRaw)
+    )
+  ).filter((quote): quote is Quote => quote !== null);
+  log(`hybrid local refine completed block=${blockTag} elapsedMs=${elapsedMs(refineStartedAt)}`);
+  const refinedBest = bestQuoteByProfit(refinedQuotes);
+  if (!refinedBest) {
+    throw new Error("hybrid local refine produced no profitable quotes");
+  }
+  const refinedEvaluation = {
+    best: refinedBest,
+    poolDecisions: buildPoolDecisions(config, refinedQuotes, refinedBest)
+  };
+  const verifyStartedAt = performance.now();
+  const verifiedEvaluation = await verifyLocalEvaluationWithEthCall(provider, config, refinedEvaluation, blockTag);
+  log(
+    `hybrid local quote verified block=${blockTag} verifyMs=${elapsedMs(verifyStartedAt)} totalMs=${elapsedMs(
+      startedAt
+    )}`
+  );
+  return {
+    evaluation: verifiedEvaluation,
+    seeded: baseRun.seeded
   };
 }
 
@@ -799,7 +1138,10 @@ async function compareLocalQuoteShadow(
       tickDataProvider
     );
     const output = CurrencyAmount.fromRawAmount(AWETH_TOKEN, quote.amountOut.toString());
-    const [input] = await pool.getInputAmount(output);
+    const [input] = await pool.getInputAmount(
+      output,
+      JSBI.BigInt(MIN_SQRT_RATIO_PLUS_ONE.toString()) as never
+    );
     const localAmountIn = BigInt(input.quotient.toString());
     const localMaxIn = localAmountIn;
     const localBufferedProfit = quote.amountOut - localMaxIn;
@@ -1032,19 +1374,33 @@ async function runOnce(
   let evaluation: QuoteEvaluation;
   let seeded = false;
   let evaluationProvider = quoteProvider;
+  let quoteSource = "hybrid_local_verified";
   try {
-    const result = await findBestEthCallQuote(quoteProvider, config, seedEvaluation);
+    const result = await withTimeout(
+      findBestLocalVerifiedQuote(quoteProvider, quoteFallbackProvider, config, seedEvaluation),
+      config.localQuoteTimeoutMs,
+      "hybrid local verified quote"
+    );
     evaluation = result.evaluation;
     seeded = result.seeded;
   } catch (error) {
-    if (!quoteFallbackProvider) throw error;
-    evaluationProvider = quoteFallbackProvider;
-    const result = await findBestEthCallQuote(quoteFallbackProvider, config, seedEvaluation);
-    evaluation = result.evaluation;
-    seeded = result.seeded;
+    console.warn(`[${timestamp()}] hybrid local verified quote failed; falling back to eth_call scan:`, error);
+    try {
+      const result = await findBestEthCallQuote(quoteProvider, config, seedEvaluation);
+      evaluation = result.evaluation;
+      seeded = result.seeded;
+      quoteSource = "eth_call_fallback";
+    } catch (fallbackError) {
+      if (!quoteFallbackProvider) throw fallbackError;
+      evaluationProvider = quoteFallbackProvider;
+      const result = await findBestEthCallQuote(quoteFallbackProvider, config, seedEvaluation);
+      evaluation = result.evaluation;
+      seeded = result.seeded;
+      quoteSource = "eth_call_fallback";
+    }
   }
 
-  logEvaluation(seeded ? "eth_call_seeded" : "eth_call", evaluation, config);
+  logEvaluation(seeded ? `${quoteSource}_seeded` : quoteSource, evaluation, config);
 
   if (config.localQuoteShadow) {
     void compareLocalQuoteShadow(evaluationProvider, quoteFallbackProvider, config, evaluation.best);
@@ -1488,7 +1844,15 @@ async function main(): Promise<void> {
       `wsRpc=${config.wsRpcUrl ? redactUrl(config.wsRpcUrl) : "disabled"}`,
       `poolAddress=${config.poolAddress ?? "auto"}`,
       `poolFees=${config.poolFees.join(",")}`,
+      "quoteEngine=eth_call_center_with_local_refine",
+      `maxEth=${config.maxEth}`,
+      `lowCoarseMaxEth=${config.lowCoarseMaxEth}`,
+      `lowCoarseStepEth=${config.lowCoarseStepEth}`,
+      `coarseStepEth=${config.coarseStepEth}`,
+      `fineStepEth=${config.fineStepEth}`,
+      `fineWindowEth=${config.fineWindowEth}`,
       `quoteBatchSize=${config.quoteBatchSize}`,
+      `localQuoteTimeoutMs=${config.localQuoteTimeoutMs}`,
       `localQuoteShadow=${config.localQuoteShadow}`,
       `swapPoolMinAwethRatioBps=${config.swapPoolMinAwethRatioBps}`,
       `eventDebounceMs=${config.eventDebounceMs}`,
