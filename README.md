@@ -8,6 +8,8 @@ If the WebSocket connection closes or errors, the monitor tears down the old eve
 
 Quote scans are batched through Multicall3. With the defaults, the monitor first scans `0.5` aWETH steps through `5` aWETH. If that low range has no profitable quote, the evaluation stops there. Fee tiers with no profitable low-range quote are skipped for the high-range scan; active fee tiers continue with `5` aWETH steps above that and stop at the first high-range batch with no profitable quotes. The fine scan then uses `0.1` aWETH steps around each fee tier's own best coarse result, so 100/500/3000 fee caps do not drift from their matching pools. With `QUOTE_BATCH_SIZE=80`, the default single-fee scan is about 3 quote RPC calls. If a quote RPC rejects a Multicall3 batch, that batch is split and retried recursively before falling back to single quoter calls. Pool/executor events are deduplicated by transaction hash and debounced for 2 seconds before triggering an evaluation.
 
+After the startup scan, event-triggered evaluations reuse the previous per-fee best caps as seeds and first scan only the fine window around those caps for faster reaction. If a seeded result lands on the edge of the window, the monitor falls back to the full coarse scan so large moves are not missed. Periodic interval evaluations always run the full scan, so the interval acts as a slower correction pass.
+
 After each evaluation, the monitor keeps the configured fee tiers fixed on the executor. If the on-chain pool or fee list is not aligned with `POOL_FEES`, it syncs the full list once through `setSwapPoolsWithMaxTargetAweths(address[],uint24[],uint256[])`. Once the list is aligned, normal updates only call `setSwapPoolMaxTargetAweths(uint24[],uint256[])` for fee tiers whose cap moved by more than `UPDATE_DEVIATION_BPS`. Fee tiers with no profitable quote stay in the list with a `1 wei` cap, which makes the executor skip them before calling the quoter.
 
 Set `MONITOR_INTERVAL_MS=0` to disable the periodic fallback and run from startup plus WebSocket events only.
@@ -72,7 +74,7 @@ It also uploads a deploy artifact containing `docker-compose.yml` and `.env.exam
 - `FINE_WINDOW_ETH`: fine scan window around the best coarse result, default `3`.
 - `QUOTE_BATCH_SIZE`: number of quote calls per Multicall3 request, default `80`.
 - `QUOTE_CONCURRENCY`: number of Multicall3 quote batches to run concurrently, default `6`.
-- `LOCAL_QUOTE_SHADOW`: enable non-invasive local Uniswap V3 SDK quote comparison logs, default `false`.
+- `LOCAL_QUOTE_SHADOW`: enable non-invasive local Uniswap V3 SDK quote comparison logs for the best eth_call quote, default `false`.
 - `SWAP_POOL_MIN_AWETH_RATIO_BPS`: optional minimum per-pool aWETH target ratio versus the best pool before a profitable quote gets a real cap; default `0`, meaning every profitable configured fee tier gets its own cap. Fee tiers without a kept quote are written as `1 wei`.
 - `EVENT_DEBOUNCE_MS`: delay used to merge pool/executor events before re-evaluating, default `2000`.
 - `MONITOR_INTERVAL_MS`: monitor interval, default `600000`; set `0` to disable the interval and only evaluate on startup/events.

@@ -96,6 +96,11 @@ type QuoteEvaluation = {
   poolDecisions: PoolDecision[];
 };
 
+type QuoteRun = {
+  evaluation: QuoteEvaluation;
+  seeded: boolean;
+};
+
 type Config = {
   quoteRpcUrl: string;
   quoteFallbackRpcUrl: string;
@@ -524,121 +529,44 @@ function sendNotification(notifier: BarkNotifier | null, notification: BarkNotif
   void notifier.send(notification);
 }
 
-async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise<QuoteEvaluation> {
-  const multicall = new Contract(MULTICALL3, MULTICALL3_ABI, provider);
-  const quoter = new Contract(QUOTER_V2, QUOTER_ABI, provider);
-  const quoterInterface = new Interface(QUOTER_ABI);
+type QuoteBatch = (fee: number, outEthValues: number[]) => Promise<Array<Quote | null>>;
+type QuoteMany = (outEthValues: number[], fees?: number[]) => Promise<Array<Quote | null>>;
 
-  function buildQuoteFromResult(
-    fee: number,
-    outEth: number,
-    amountIn: bigint,
-    sqrtPriceX96After: bigint,
-    ticksCrossed: bigint,
-    gasEstimate: bigint
-  ): Quote {
-    const amountOut = parseEther(String(outEth));
-    const maxIn = amountIn + (amountIn * INPUT_BUFFER_BPS) / SCALE_BPS;
-    const bufferedProfit = amountOut - maxIn;
+function buildQuoteFromInput(
+  fee: number,
+  outEth: number,
+  amountIn: bigint,
+  sqrtPriceX96After: bigint,
+  ticksCrossed: bigint,
+  gasEstimate: bigint
+): Quote {
+  const amountOut = parseEther(String(outEth));
+  const maxIn = amountIn + (amountIn * INPUT_BUFFER_BPS) / SCALE_BPS;
+  const bufferedProfit = amountOut - maxIn;
 
-    return {
-      reason: "profitable-quote",
-      fee,
-      outEth,
-      amountOut,
-      amountIn,
-      maxIn,
-      bufferedProfit,
-      profitBps: (bufferedProfit * SCALE_BPS) / amountOut,
-      sqrtPriceX96After,
-      ticksCrossed: Number(ticksCrossed),
-      gasEstimate: Number(gasEstimate)
-    };
-  }
+  return {
+    reason: "profitable-quote",
+    fee,
+    outEth,
+    amountOut,
+    amountIn,
+    maxIn,
+    bufferedProfit,
+    profitBps: (bufferedProfit * SCALE_BPS) / amountOut,
+    sqrtPriceX96After,
+    ticksCrossed: Number(ticksCrossed),
+    gasEstimate: Number(gasEstimate)
+  };
+}
 
-  function buildQuote(fee: number, outEth: number, returnData: string): Quote | null {
-    try {
-      const [amountIn, sqrtPriceX96After, ticksCrossed, gasEstimate] =
-        quoterInterface.decodeFunctionResult("quoteExactOutputSingle", returnData);
-      return buildQuoteFromResult(fee, outEth, amountIn, sqrtPriceX96After, ticksCrossed, gasEstimate);
-    } catch {
-      return null;
-    }
-  }
+function validQuotes(quotes: Array<Quote | null>): Quote[] {
+  return quotes
+    .filter((item): item is Quote => item !== null)
+    .filter((item) => item.sqrtPriceX96After !== MIN_SQRT_RATIO_PLUS_ONE && item.bufferedProfit > 0n)
+    .sort((a, b) => (a.bufferedProfit < b.bufferedProfit ? 1 : -1));
+}
 
-  function quoteParams(fee: number, outEth: number) {
-    return {
-      tokenIn: WETH,
-      tokenOut: AWETH,
-      amount: parseEther(String(outEth)),
-      fee,
-      sqrtPriceLimitX96: MIN_SQRT_RATIO_PLUS_ONE
-    };
-  }
-
-  async function quoteSingle(fee: number, outEth: number): Promise<Quote | null> {
-    try {
-      const [amountIn, sqrtPriceX96After, ticksCrossed, gasEstimate] =
-        await quoter.quoteExactOutputSingle.staticCall(quoteParams(fee, outEth));
-      return buildQuoteFromResult(fee, outEth, amountIn, sqrtPriceX96After, ticksCrossed, gasEstimate);
-    } catch (error) {
-      if (!isQuoteRevert(error)) throw error;
-      return null;
-    }
-  }
-
-  async function quoteSingles(fee: number, outEthValues: number[]): Promise<Array<Quote | null>> {
-    const quotes: Array<Quote | null> = [];
-    for (const outEth of outEthValues) {
-      quotes.push(await quoteSingle(fee, outEth));
-    }
-    return quotes;
-  }
-
-  async function quoteBatch(fee: number, outEthValues: number[]): Promise<Array<Quote | null>> {
-    if (outEthValues.length === 1) {
-      return quoteSingles(fee, outEthValues);
-    }
-
-    const calls = outEthValues.map((outEth) => ({
-      target: QUOTER_V2,
-      allowFailure: true,
-      callData: quoterInterface.encodeFunctionData("quoteExactOutputSingle", [quoteParams(fee, outEth)])
-    }));
-
-    try {
-      const results = await multicall.aggregate3.staticCall(calls);
-      return results.map((result: { success: boolean; returnData: string }, index: number) => {
-        if (!result.success) return null;
-        return buildQuote(fee, outEthValues[index], result.returnData);
-      });
-    } catch (error) {
-      if (outEthValues.length <= 2) {
-        return quoteSingles(fee, outEthValues);
-      }
-      const midpoint = Math.ceil(outEthValues.length / 2);
-      const [left, right] = await Promise.all([
-        quoteBatch(fee, outEthValues.slice(0, midpoint)),
-        quoteBatch(fee, outEthValues.slice(midpoint))
-      ]);
-      return [...left, ...right];
-    }
-  }
-
-  async function quoteMany(outEthValues: number[], fees = config.poolFees): Promise<Array<Quote | null>> {
-    const batches = fees.flatMap((fee) =>
-      chunk(outEthValues, config.quoteBatchSize).map((values) => ({ fee, values }))
-    );
-    const batchQuotes = await mapLimit(batches, config.concurrency, (batch) => quoteBatch(batch.fee, batch.values));
-    return batchQuotes.flat();
-  }
-
-  const validQuotes = (quotes: Array<Quote | null>): Quote[] =>
-    quotes
-      .filter((item): item is Quote => item !== null)
-      .filter((item) => item.sqrtPriceX96After !== MIN_SQRT_RATIO_PLUS_ONE && item.bufferedProfit > 0n)
-      .sort((a, b) => (a.bufferedProfit < b.bufferedProfit ? 1 : -1));
-
+async function scanBestQuote(config: Config, quoteMany: QuoteMany, quoteBatch: QuoteBatch): Promise<QuoteEvaluation> {
   async function quoteCoarseUntilUnprofitable(outEthValues: number[], fees: number[]): Promise<Quote[]> {
     const feeQuotes = await mapLimit(fees, config.concurrency, async (fee) => {
       const quotes: Quote[] = [];
@@ -701,6 +629,206 @@ async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise
   };
 }
 
+async function scanSeededBestQuote(
+  config: Config,
+  quoteMany: QuoteMany,
+  seedEvaluation: QuoteEvaluation
+): Promise<QuoteEvaluation | null> {
+  const centers = seedEvaluation.poolDecisions
+    .map((decision) => decision.quote)
+    .filter((quote): quote is Quote => quote !== null);
+
+  if (centers.length === 0) return null;
+
+  const quoteGroups = await mapLimit(centers, config.concurrency, (quote) => {
+    const fineStart = Math.max(config.fineStepEth, quote.outEth - config.fineWindowEth);
+    const fineEnd = Math.min(config.maxEth, quote.outEth + config.fineWindowEth);
+    return quoteMany(range(fineStart, fineEnd, config.fineStepEth), [quote.fee]);
+  });
+  const quotes = validQuotes(quoteGroups.flat());
+  const best = bestQuoteByProfit(quotes);
+
+  if (!best) return null;
+
+  const centerByFee = new Map(centers.map((quote) => [quote.fee, quote]));
+  const edgeHit = config.poolFees.some((fee) => {
+    const center = centerByFee.get(fee);
+    const quote = bestQuoteByProfit(quotes.filter((item) => item.fee === fee));
+    if (!center || !quote) return false;
+
+    const fineStart = Math.max(config.fineStepEth, center.outEth - config.fineWindowEth);
+    const fineEnd = Math.min(config.maxEth, center.outEth + config.fineWindowEth);
+    return quote.outEth <= fineStart + config.fineStepEth / 10 || quote.outEth >= fineEnd - config.fineStepEth / 10;
+  });
+
+  if (edgeHit) return null;
+
+  return {
+    best,
+    poolDecisions: buildPoolDecisions(config, quotes, best)
+  };
+}
+
+async function findBestEthCallQuote(
+  provider: JsonRpcProvider,
+  config: Config,
+  seedEvaluation: QuoteEvaluation | null = null
+): Promise<QuoteRun> {
+  const multicall = new Contract(MULTICALL3, MULTICALL3_ABI, provider);
+  const quoter = new Contract(QUOTER_V2, QUOTER_ABI, provider);
+  const quoterInterface = new Interface(QUOTER_ABI);
+
+  function buildQuote(fee: number, outEth: number, returnData: string): Quote | null {
+    try {
+      const [amountIn, sqrtPriceX96After, ticksCrossed, gasEstimate] =
+        quoterInterface.decodeFunctionResult("quoteExactOutputSingle", returnData);
+      return buildQuoteFromInput(fee, outEth, amountIn, sqrtPriceX96After, ticksCrossed, gasEstimate);
+    } catch {
+      return null;
+    }
+  }
+
+  function quoteParams(fee: number, outEth: number) {
+    return {
+      tokenIn: WETH,
+      tokenOut: AWETH,
+      amount: parseEther(String(outEth)),
+      fee,
+      sqrtPriceLimitX96: MIN_SQRT_RATIO_PLUS_ONE
+    };
+  }
+
+  async function quoteSingle(fee: number, outEth: number): Promise<Quote | null> {
+    try {
+      const [amountIn, sqrtPriceX96After, ticksCrossed, gasEstimate] =
+        await quoter.quoteExactOutputSingle.staticCall(quoteParams(fee, outEth));
+      return buildQuoteFromInput(fee, outEth, amountIn, sqrtPriceX96After, ticksCrossed, gasEstimate);
+    } catch (error) {
+      if (!isQuoteRevert(error)) throw error;
+      return null;
+    }
+  }
+
+  async function quoteSingles(fee: number, outEthValues: number[]): Promise<Array<Quote | null>> {
+    const quotes: Array<Quote | null> = [];
+    for (const outEth of outEthValues) {
+      quotes.push(await quoteSingle(fee, outEth));
+    }
+    return quotes;
+  }
+
+  async function quoteBatch(fee: number, outEthValues: number[]): Promise<Array<Quote | null>> {
+    if (outEthValues.length === 1) {
+      return quoteSingles(fee, outEthValues);
+    }
+
+    const calls = outEthValues.map((outEth) => ({
+      target: QUOTER_V2,
+      allowFailure: true,
+      callData: quoterInterface.encodeFunctionData("quoteExactOutputSingle", [quoteParams(fee, outEth)])
+    }));
+
+    try {
+      const results = await multicall.aggregate3.staticCall(calls);
+      return results.map((result: { success: boolean; returnData: string }, index: number) => {
+        if (!result.success) return null;
+        return buildQuote(fee, outEthValues[index], result.returnData);
+      });
+    } catch (error) {
+      if (outEthValues.length <= 2) {
+        return quoteSingles(fee, outEthValues);
+      }
+      const midpoint = Math.ceil(outEthValues.length / 2);
+      const [left, right] = await Promise.all([
+        quoteBatch(fee, outEthValues.slice(0, midpoint)),
+        quoteBatch(fee, outEthValues.slice(midpoint))
+      ]);
+      return [...left, ...right];
+    }
+  }
+
+  async function quoteMany(outEthValues: number[], fees = config.poolFees): Promise<Array<Quote | null>> {
+    const batches = fees.flatMap((fee) =>
+      chunk(outEthValues, config.quoteBatchSize).map((values) => ({ fee, values }))
+    );
+    const batchQuotes = await mapLimit(batches, config.concurrency, (batch) => quoteBatch(batch.fee, batch.values));
+    return batchQuotes.flat();
+  }
+
+  if (seedEvaluation) {
+    const seededEvaluation = await scanSeededBestQuote(config, quoteMany, seedEvaluation);
+    if (seededEvaluation) {
+      return {
+        evaluation: seededEvaluation,
+        seeded: true
+      };
+    }
+    log("seeded scan fell back to full scan");
+  }
+
+  return {
+    evaluation: await scanBestQuote(config, quoteMany, quoteBatch),
+    seeded: false
+  };
+}
+
+async function compareLocalQuoteShadow(
+  provider: JsonRpcProvider,
+  fallbackProvider: JsonRpcProvider | null,
+  config: Config,
+  quote: Quote
+): Promise<void> {
+  const startedAt = performance.now();
+  try {
+    if (quote.reason !== "profitable-quote" || quote.fee === 0) return;
+
+    const storageStartedAt = performance.now();
+    const poolAddress = await resolvePoolAddressForFee(provider, fallbackProvider, config, quote.fee);
+    const poolContract = new Contract(poolAddress, POOL_ABI, provider);
+    const [slot0, liquidity] = await Promise.all([poolContract.slot0(), poolContract.liquidity()]);
+    const storageMs = elapsedMs(storageStartedAt);
+
+    const localComputeStartedAt = performance.now();
+    const tickDataProvider = new RpcTickDataProvider(poolContract);
+    const pool = new Pool(
+      WETH_TOKEN,
+      AWETH_TOKEN,
+      quote.fee as FeeAmount,
+      BigInt(slot0.sqrtPriceX96).toString(),
+      BigInt(liquidity).toString(),
+      Number(slot0.tick),
+      tickDataProvider
+    );
+    const output = CurrencyAmount.fromRawAmount(AWETH_TOKEN, quote.amountOut.toString());
+    const [input] = await pool.getInputAmount(output);
+    const localAmountIn = BigInt(input.quotient.toString());
+    const localMaxIn = localAmountIn + (localAmountIn * INPUT_BUFFER_BPS) / SCALE_BPS;
+    const localBufferedProfit = quote.amountOut - localMaxIn;
+    const amountInDiff = localAmountIn - quote.amountIn;
+    const bufferedProfitDiff = localBufferedProfit - quote.bufferedProfit;
+    const localComputeMs = elapsedMs(localComputeStartedAt);
+
+    log(
+      [
+        "localQuoteShadow",
+        `totalMs=${elapsedMs(startedAt)}`,
+        `storageMs=${storageMs}`,
+        `localComputeMs=${localComputeMs}`,
+        `fee=${quote.fee}`,
+        `target=${format(quote.amountOut)}aWETH`,
+        `rpcAmountIn=${format(quote.amountIn)}WETH`,
+        `localAmountIn=${format(localAmountIn)}WETH`,
+        `amountInDiffWei=${amountInDiff.toString()}`,
+        `rpcBufferedProfit=${format(quote.bufferedProfit)}WETH`,
+        `localBufferedProfit=${format(localBufferedProfit)}WETH`,
+        `bufferedProfitDiffWei=${bufferedProfitDiff.toString()}`
+      ].join(" ")
+    );
+  } catch (error) {
+    console.warn(`[${timestamp()}] localQuoteShadow failed:`, error);
+  }
+}
+
 function sameFeeList(left: number[], right: number[]): boolean {
   return left.length === right.length && left.every((fee, index) => fee === right[index]);
 }
@@ -734,6 +862,54 @@ function formatPoolDecisions(decisions: PoolDecision[]): string {
       return `${decision.fee}:${decision.keep ? "keep" : "remove"}:${decision.reason}:aweth=${aweth}:bufferedProfit=${profit}`;
     })
     .join(",");
+}
+
+function formatPoolCapsForNotification(decisions: PoolDecision[]): string {
+  const caps = decisions
+    .filter((decision) => targetAmountForDecision(decision) !== 1n)
+    .map((decision) => `${decision.fee}: ${format(targetAmountForDecision(decision))} aWETH`);
+  return caps.length > 0 ? caps.join("\n") : "none";
+}
+
+function totalBufferedProfit(decisions: PoolDecision[]): bigint {
+  return decisions.reduce((total, decision) => total + (decision.quote?.bufferedProfit ?? 0n), 0n);
+}
+
+function logEvaluation(source: string, evaluation: QuoteEvaluation, config: Config): void {
+  const { best, poolDecisions } = evaluation;
+  log(
+    [
+      `quoteSource=${source}`,
+      `recommended=${format(best.amountOut)}aWETH`,
+      `fee=${best.fee}`,
+      `reason=${best.reason}`,
+      `thresholdBps=${config.deviationBps}`,
+      `bufferedProfit=${format(best.bufferedProfit)}WETH`,
+      `profitBps=${best.profitBps.toString()}`,
+      `ticks=${best.ticksCrossed}`,
+      `quoteGas=${best.gasEstimate}`,
+      `poolDecisions=${formatPoolDecisions(poolDecisions)}`
+    ].join(" ")
+  );
+}
+
+function sendCapsUpdatedNotification(
+  notifier: BarkNotifier | null,
+  evaluation: QuoteEvaluation,
+  titleSuffix = ""
+): void {
+  const { best, poolDecisions } = evaluation;
+  sendNotification(notifier, {
+    title: `aWETH Pool Caps Updated${titleSuffix}`,
+    body: [
+      `Best fee: ${best.fee}`,
+      `Best cap: ${format(best.amountOut)} aWETH`,
+      `Reason: ${best.reason}`,
+      `Max buffer profit: ${format(totalBufferedProfit(poolDecisions))} WETH`,
+      "Pool caps:",
+      formatPoolCapsForNotification(poolDecisions)
+    ].join("\n")
+  });
 }
 
 async function resolveSwapPoolAddressForFee(
@@ -841,112 +1017,40 @@ async function syncSwapPools(
   return true;
 }
 
-async function compareLocalQuoteShadow(
-  provider: JsonRpcProvider,
-  fallbackProvider: JsonRpcProvider | null,
-  config: Config,
-  quote: Quote
-): Promise<void> {
-  const startedAt = performance.now();
-  try {
-    if (quote.reason !== "profitable-quote" || quote.fee === 0) return;
-
-    const storageStartedAt = performance.now();
-    const poolAddress = await resolvePoolAddressForFee(provider, fallbackProvider, config, quote.fee);
-    const poolContract = new Contract(poolAddress, POOL_ABI, provider);
-    const [slot0, liquidity] = await Promise.all([poolContract.slot0(), poolContract.liquidity()]);
-    const storageMs = elapsedMs(storageStartedAt);
-
-    const localComputeStartedAt = performance.now();
-    const tickDataProvider = new RpcTickDataProvider(poolContract);
-    const pool = new Pool(
-      WETH_TOKEN,
-      AWETH_TOKEN,
-      quote.fee as FeeAmount,
-      BigInt(slot0.sqrtPriceX96).toString(),
-      BigInt(liquidity).toString(),
-      Number(slot0.tick),
-      tickDataProvider
-    );
-    const output = CurrencyAmount.fromRawAmount(AWETH_TOKEN, quote.amountOut.toString());
-    const [input] = await pool.getInputAmount(output);
-    const localAmountIn = BigInt(input.quotient.toString());
-    const localMaxIn = localAmountIn + (localAmountIn * INPUT_BUFFER_BPS) / SCALE_BPS;
-    const localBufferedProfit = quote.amountOut - localMaxIn;
-    const amountInDiff = localAmountIn - quote.amountIn;
-    const bufferedProfitDiff = localBufferedProfit - quote.bufferedProfit;
-    const localComputeMs = elapsedMs(localComputeStartedAt);
-
-    log(
-      [
-        "localQuoteShadow",
-        `totalMs=${elapsedMs(startedAt)}`,
-        `storageMs=${storageMs}`,
-        `localComputeMs=${localComputeMs}`,
-        `fee=${quote.fee}`,
-        `target=${format(quote.amountOut)}aWETH`,
-        `rpcAmountIn=${format(quote.amountIn)}WETH`,
-        `localAmountIn=${format(localAmountIn)}WETH`,
-        `amountInDiffWei=${amountInDiff.toString()}`,
-        `rpcBufferedProfit=${format(quote.bufferedProfit)}WETH`,
-        `localBufferedProfit=${format(localBufferedProfit)}WETH`,
-        `bufferedProfitDiffWei=${bufferedProfitDiff.toString()}`
-      ].join(" ")
-    );
-  } catch (error) {
-    console.warn(`[${timestamp()}] localQuoteShadow failed:`, error);
-  }
-}
-
 async function runOnce(
   quoteProvider: JsonRpcProvider,
   quoteFallbackProvider: JsonRpcProvider | null,
   executor: Contract,
   config: Config,
-  notifier: BarkNotifier | null
-): Promise<void> {
+  notifier: BarkNotifier | null,
+  seedEvaluation: QuoteEvaluation | null
+): Promise<QuoteEvaluation> {
   let evaluation: QuoteEvaluation;
+  let seeded = false;
   let evaluationProvider = quoteProvider;
   try {
-    evaluation = await findBestQuote(quoteProvider, config);
+    const result = await findBestEthCallQuote(quoteProvider, config, seedEvaluation);
+    evaluation = result.evaluation;
+    seeded = result.seeded;
   } catch (error) {
     if (!quoteFallbackProvider) throw error;
     evaluationProvider = quoteFallbackProvider;
-    evaluation = await findBestQuote(quoteFallbackProvider, config);
+    const result = await findBestEthCallQuote(quoteFallbackProvider, config, seedEvaluation);
+    evaluation = result.evaluation;
+    seeded = result.seeded;
   }
-  const { best, poolDecisions } = evaluation;
 
-  log(
-    [
-      `recommended=${format(best.amountOut)}aWETH`,
-      `fee=${best.fee}`,
-      `reason=${best.reason}`,
-      `thresholdBps=${config.deviationBps}`,
-      `bufferedProfit=${format(best.bufferedProfit)}WETH`,
-      `profitBps=${best.profitBps.toString()}`,
-      `ticks=${best.ticksCrossed}`,
-      `quoteGas=${best.gasEstimate}`,
-      `poolDecisions=${formatPoolDecisions(poolDecisions)}`
-    ].join(" ")
-  );
+  logEvaluation(seeded ? "eth_call_seeded" : "eth_call", evaluation, config);
 
   if (config.localQuoteShadow) {
-    void compareLocalQuoteShadow(evaluationProvider, quoteFallbackProvider, config, best);
+    void compareLocalQuoteShadow(evaluationProvider, quoteFallbackProvider, config, evaluation.best);
   }
 
-  const updated = await syncSwapPools(quoteProvider, quoteFallbackProvider, executor, config, poolDecisions);
-  if (!updated) return;
-
-  sendNotification(notifier, {
-    title: "aWETH Pool Caps Updated",
-    body: [
-      `Best fee: ${best.fee}`,
-      `Best cap: ${format(best.amountOut)} aWETH`,
-      `Reason: ${best.reason}`,
-      `Max buffer profit: ${format(best.bufferedProfit)} WETH`,
-      `Pool caps: ${formatPoolDecisions(poolDecisions)}`
-    ].join("\n")
-  });
+  const updated = await syncSwapPools(quoteProvider, quoteFallbackProvider, executor, config, evaluation.poolDecisions);
+  if (updated) {
+    sendCapsUpdatedNotification(notifier, evaluation);
+  }
+  return evaluation;
 }
 
 class EvaluationRunner {
@@ -954,6 +1058,7 @@ class EvaluationRunner {
   private queuedReason: string | null = null;
   private eventTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingEventReason: string | null = null;
+  private lastEvaluation: QuoteEvaluation | null = null;
   private readonly seenEventTxs = new Map<string, number>();
 
   public constructor(
@@ -1021,7 +1126,18 @@ class EvaluationRunner {
     while (reason) {
       log(`evaluation start reason=${reason}`);
       try {
-        await runOnce(this.quoteProvider, this.quoteFallbackProvider, this.executor, this.config, this.notifier);
+        const seedEvaluation =
+          reason === "startup" || reason === "interval"
+            ? null
+            : this.lastEvaluation;
+        this.lastEvaluation = await runOnce(
+          this.quoteProvider,
+          this.quoteFallbackProvider,
+          this.executor,
+          this.config,
+          this.notifier,
+          seedEvaluation
+        );
       } catch (error) {
         console.error(`[${timestamp()}] evaluation failed reason=${reason}:`, error);
         sendNotification(this.notifier, {
