@@ -28,7 +28,6 @@ const AWETH = "0xe50fA9b3c56FfB159cB0FCA61F5c9D750e8128c8";
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const MIN_SQRT_RATIO_PLUS_ONE = 4_295_128_740n;
 const SCALE_BPS = 10_000n;
-const INPUT_BUFFER_BPS = 1n;
 const DEFAULT_SWAP_POOL_MIN_AWETH_RATIO_BPS = 0;
 const WS_RECONNECT_DELAY_MS = 5_000;
 const EVENT_TX_DEDUPE_TTL_MS = 60_000;
@@ -541,7 +540,7 @@ function buildQuoteFromInput(
   gasEstimate: bigint
 ): Quote {
   const amountOut = parseEther(String(outEth));
-  const maxIn = amountIn + (amountIn * INPUT_BUFFER_BPS) / SCALE_BPS;
+  const maxIn = amountIn;
   const bufferedProfit = amountOut - maxIn;
 
   return {
@@ -802,7 +801,7 @@ async function compareLocalQuoteShadow(
     const output = CurrencyAmount.fromRawAmount(AWETH_TOKEN, quote.amountOut.toString());
     const [input] = await pool.getInputAmount(output);
     const localAmountIn = BigInt(input.quotient.toString());
-    const localMaxIn = localAmountIn + (localAmountIn * INPUT_BUFFER_BPS) / SCALE_BPS;
+    const localMaxIn = localAmountIn;
     const localBufferedProfit = quote.amountOut - localMaxIn;
     const amountInDiff = localAmountIn - quote.amountIn;
     const bufferedProfitDiff = localBufferedProfit - quote.bufferedProfit;
@@ -819,9 +818,9 @@ async function compareLocalQuoteShadow(
         `rpcAmountIn=${format(quote.amountIn)}WETH`,
         `localAmountIn=${format(localAmountIn)}WETH`,
         `amountInDiffWei=${amountInDiff.toString()}`,
-        `rpcBufferedProfit=${format(quote.bufferedProfit)}WETH`,
-        `localBufferedProfit=${format(localBufferedProfit)}WETH`,
-        `bufferedProfitDiffWei=${bufferedProfitDiff.toString()}`
+        `rpcProfit=${format(quote.bufferedProfit)}WETH`,
+        `localProfit=${format(localBufferedProfit)}WETH`,
+        `profitDiffWei=${bufferedProfitDiff.toString()}`
       ].join(" ")
     );
   } catch (error) {
@@ -905,7 +904,7 @@ function sendCapsUpdatedNotification(
       `Best fee: ${best.fee}`,
       `Best cap: ${format(best.amountOut)} aWETH`,
       `Reason: ${best.reason}`,
-      `Max buffer profit: ${format(totalBufferedProfit(poolDecisions))} WETH`,
+      `Max profit: ${format(totalBufferedProfit(poolDecisions))} WETH`,
       "Pool caps:",
       formatPoolCapsForNotification(poolDecisions)
     ].join("\n")
