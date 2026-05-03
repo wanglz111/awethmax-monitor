@@ -29,7 +29,7 @@ const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const MIN_SQRT_RATIO_PLUS_ONE = 4_295_128_740n;
 const SCALE_BPS = 10_000n;
 const INPUT_BUFFER_BPS = 1n;
-const DEFAULT_SWAP_POOL_MIN_AWETH_RATIO_BPS = 8_000;
+const DEFAULT_SWAP_POOL_MIN_AWETH_RATIO_BPS = 0;
 const WS_RECONNECT_DELAY_MS = 5_000;
 const EVENT_TX_DEDUPE_TTL_MS = 60_000;
 
@@ -62,8 +62,12 @@ const EXECUTOR_ABI = [
   "function maxTargetAweth() view returns (uint256)",
   "function setMaxTargetAweth(uint256 newMaxTargetAweth)",
   "function getSwapPools() view returns (address[] pools,uint24[] fees)",
+  "function getSwapPoolMaxTargetAweths() view returns (uint256[] maxTargetAweths)",
+  "function getSwapPoolsWithMaxTargetAweths() view returns (address[] pools,uint24[] fees,uint256[] maxTargetAweths)",
   "function setSwapPools(address[] pools,uint24[] fees)",
-  "event ArbitrageExecuted(uint256 flashAmount,uint256 wethSpent,uint256 profit,uint256 kairosPayment,address indexed caller,address indexed profitRecipient)"
+  "function setSwapPoolsWithMaxTargetAweths(address[] pools,uint24[] fees,uint256[] maxTargetAweths)",
+  "function setSwapPoolMaxTargetAweths(uint24[] fees,uint256[] maxTargetAweths)",
+  "event ArbitrageExecuted(uint256 flashAmount,uint256 wethSpent,uint256 profit,address indexed caller,address indexed profitRecipient)"
 ];
 
 type Quote = {
@@ -255,7 +259,7 @@ function loadConfig(): Config {
     swapPoolMinAwethRatioBps: parseBps("SWAP_POOL_MIN_AWETH_RATIO_BPS", DEFAULT_SWAP_POOL_MIN_AWETH_RATIO_BPS),
     eventDebounceMs: parseNonNegativeInteger("EVENT_DEBOUNCE_MS", 2_000),
     intervalMs: parseNonNegativeInteger("MONITOR_INTERVAL_MS", 600_000),
-    deviationBps: parseInteger("UPDATE_DEVIATION_BPS", 2_000),
+    deviationBps: parseInteger("UPDATE_DEVIATION_BPS", 500),
     dryRun,
     barkBaseUrl: optional("BARK_BASE_URL") ?? "https://api.day.app",
     barkDeviceKey: optional("BARK_DEVICE_KEY"),
@@ -321,12 +325,6 @@ function overDeviationThreshold(next: bigint, current: bigint, thresholdBps: num
   if (current === 0n) return next !== 0n;
   const delta = next > current ? next - current : current - next;
   return delta * SCALE_BPS > current * BigInt(thresholdBps);
-}
-
-function deviationBps(next: bigint, current: bigint): string {
-  if (current === 0n) return next === 0n ? "0" : "inf";
-  const delta = next > current ? next - current : current - next;
-  return ((delta * SCALE_BPS) / current).toString();
 }
 
 function errorCode(error: unknown): string | null {
@@ -475,7 +473,9 @@ function buildPoolDecisions(config: Config, quotes: Quote[], bestQuote?: Quote):
       };
     }
 
-    const keep = quote.amountOut * SCALE_BPS >= best.amountOut * BigInt(config.swapPoolMinAwethRatioBps);
+    const keep =
+      config.swapPoolMinAwethRatioBps === 0
+      || quote.amountOut * SCALE_BPS >= best.amountOut * BigInt(config.swapPoolMinAwethRatioBps);
     return {
       fee,
       quote,
@@ -682,18 +682,18 @@ async function findBestQuote(provider: JsonRpcProvider, config: Config): Promise
     };
   }
 
-  const center = validCoarse[0].outEth;
-  const fineStart = Math.max(config.fineStepEth, center - config.fineWindowEth);
-  const fineEnd = Math.min(config.maxEth, center + config.fineWindowEth);
-  const fineFees = [...new Set(validCoarse.map((quote) => quote.fee))];
-  const fineQuotes = await quoteMany(range(fineStart, fineEnd, config.fineStepEth), fineFees);
-  const validFine = fineQuotes
-    .filter((item): item is Quote => item !== null)
-    .filter((item) => item.sqrtPriceX96After !== MIN_SQRT_RATIO_PLUS_ONE && item.bufferedProfit > 0n)
-    .sort((a, b) => (a.bufferedProfit < b.bufferedProfit ? 1 : -1));
+  const fineCenters = [...new Set(validCoarse.map((quote) => quote.fee))]
+    .map((fee) => bestQuoteByProfit(validCoarse.filter((quote) => quote.fee === fee)))
+    .filter((quote): quote is Quote => quote !== null);
+  const fineQuoteGroups = await mapLimit(fineCenters, config.concurrency, (quote) => {
+    const fineStart = Math.max(config.fineStepEth, quote.outEth - config.fineWindowEth);
+    const fineEnd = Math.min(config.maxEth, quote.outEth + config.fineWindowEth);
+    return quoteMany(range(fineStart, fineEnd, config.fineStepEth), [quote.fee]);
+  });
+  const validFine = validQuotes(fineQuoteGroups.flat());
 
-  const validQuotesForDecision = validFine.length > 0 ? [...validCoarse, ...validFine] : validCoarse;
-  const best = bestQuoteByProfit(validFine) ?? validCoarse[0];
+  const validQuotesForDecision = [...validCoarse, ...validFine];
+  const best = bestQuoteByProfit(validQuotesForDecision) ?? validCoarse[0];
 
   return {
     best,
@@ -705,11 +705,33 @@ function sameFeeList(left: number[], right: number[]): boolean {
   return left.length === right.length && left.every((fee, index) => fee === right[index]);
 }
 
+function sameAddressList(left: string[], right: string[]): boolean {
+  return (
+    left.length === right.length
+    && left.every((address, index) => getAddress(address) === getAddress(right[index] ?? ZERO_ADDRESS))
+  );
+}
+
+function targetChangedIndexes(left: bigint[], right: bigint[], thresholdBps: number): number[] {
+  const indexes: number[] = [];
+  for (let index = 0; index < left.length; index += 1) {
+    if (overDeviationThreshold(left[index], right[index] ?? 0n, thresholdBps)) {
+      indexes.push(index);
+    }
+  }
+  return indexes;
+}
+
+function targetAmountForDecision(decision: PoolDecision): bigint {
+  return decision.quote?.amountOut ?? 1n;
+}
+
 function formatPoolDecisions(decisions: PoolDecision[]): string {
   return decisions
     .map((decision) => {
       const aweth = decision.quote ? format(decision.quote.amountOut) : "0.000000";
-      return `${decision.fee}:${decision.keep ? "keep" : "remove"}:${decision.reason}:aweth=${aweth}`;
+      const profit = decision.quote ? format(decision.quote.bufferedProfit) : "0.000000";
+      return `${decision.fee}:${decision.keep ? "keep" : "remove"}:${decision.reason}:aweth=${aweth}:bufferedProfit=${profit}`;
     })
     .join(",");
 }
@@ -732,36 +754,91 @@ async function syncSwapPools(
   executor: Contract,
   config: Config,
   decisions: PoolDecision[]
-): Promise<void> {
-  const targetFees = decisions.filter((decision) => decision.keep).map((decision) => decision.fee);
-  if (targetFees.length === 0) {
-    log("swapPools update skipped: no profitable pool can be kept");
-    return;
-  }
-
-  const [, currentFeesRaw] = await executor.getSwapPools();
-  const currentFees = Array.from(currentFeesRaw as Iterable<bigint | number>).map((fee) => Number(fee));
-  if (sameFeeList(currentFees, targetFees)) {
-    log(`swapPools unchanged fees=${targetFees.join(",")}`);
-    return;
-  }
-
+): Promise<boolean> {
+  const targetFees = config.poolFees;
+  const targetMaxTargetAweths = targetFees.map((fee) => {
+    const decision = decisions.find((item) => item.fee === fee);
+    return decision ? targetAmountForDecision(decision) : 1n;
+  });
   const targetPools = await Promise.all(
     targetFees.map((fee) => resolveSwapPoolAddressForFee(quoteProvider, quoteFallbackProvider, config, fee))
   );
 
-  if (config.dryRun) {
-    log(`dry-run skip setSwapPools(pools=[${targetPools.join(",")}], fees=[${targetFees.join(",")}])`);
-    return;
+  const [currentPoolsRaw, currentFeesRaw] = await executor.getSwapPools();
+  const currentPools = Array.from(currentPoolsRaw as Iterable<string>).map((pool) => getAddress(pool));
+  const currentFees = Array.from(currentFeesRaw as Iterable<bigint | number>).map((fee) => Number(fee));
+
+  let currentMaxTargetAweths: bigint[];
+  try {
+    const currentTargetsRaw = await executor.getSwapPoolMaxTargetAweths();
+    currentMaxTargetAweths = Array.from(currentTargetsRaw as Iterable<bigint | number>).map((target) =>
+      BigInt(target)
+    );
+  } catch {
+    const legacyGlobalTarget = BigInt(await executor.maxTargetAweth());
+    currentMaxTargetAweths = currentFees.map(() => legacyGlobalTarget);
   }
 
-  const tx = await executor.setSwapPools(targetPools, targetFees);
-  log(`setSwapPools sent hash=${tx.hash} fees=${targetFees.join(",")}`);
+  const feeListChanged = !sameFeeList(currentFees, targetFees);
+  const poolListChanged = !sameAddressList(currentPools, targetPools);
+  const changedIndexes = targetChangedIndexes(targetMaxTargetAweths, currentMaxTargetAweths, config.deviationBps);
+
+  if (!feeListChanged && !poolListChanged && changedIndexes.length === 0) {
+    log(
+      `swapPools unchanged fees=${targetFees.join(",")} targets=[${targetMaxTargetAweths
+        .map((target) => format(target))
+        .join(",")}]`
+    );
+    return false;
+  }
+
+  if (feeListChanged || poolListChanged) {
+    if (config.dryRun) {
+      log(
+        `dry-run skip setSwapPoolsWithMaxTargetAweths(pools=[${targetPools.join(",")}], fees=[${targetFees.join(
+          ","
+        )}], targets=[${targetMaxTargetAweths.map((target) => target.toString()).join(",")}])`
+      );
+      return false;
+    }
+
+    const tx = await executor.setSwapPoolsWithMaxTargetAweths(targetPools, targetFees, targetMaxTargetAweths);
+    log(
+      `setSwapPoolsWithMaxTargetAweths sent hash=${tx.hash} fees=${targetFees.join(",")} targets=[${targetMaxTargetAweths
+        .map((target) => format(target))
+        .join(",")}]`
+    );
+    const receipt = await tx.wait(1);
+    if (!receipt || receipt.status !== 1) {
+      throw new Error(`setSwapPoolsWithMaxTargetAweths failed hash=${tx.hash}`);
+    }
+    log(`setSwapPoolsWithMaxTargetAweths confirmed block=${receipt.blockNumber} fees=${targetFees.join(",")}`);
+    return true;
+  }
+
+  const changedFees = changedIndexes.map((index) => targetFees[index]);
+  const changedTargets = changedIndexes.map((index) => targetMaxTargetAweths[index]);
+  if (config.dryRun) {
+    log(
+      `dry-run skip setSwapPoolMaxTargetAweths(fees=[${changedFees.join(",")}], targets=[${changedTargets
+        .map((target) => target.toString())
+        .join(",")}])`
+    );
+    return false;
+  }
+
+  const tx = await executor.setSwapPoolMaxTargetAweths(changedFees, changedTargets);
+  log(
+    `setSwapPoolMaxTargetAweths sent hash=${tx.hash} fees=${changedFees.join(",")} targets=[${changedTargets
+      .map((target) => format(target))
+      .join(",")}]`
+  );
   const receipt = await tx.wait(1);
   if (!receipt || receipt.status !== 1) {
-    throw new Error(`setSwapPools failed hash=${tx.hash}`);
+    throw new Error(`setSwapPoolMaxTargetAweths failed hash=${tx.hash}`);
   }
-  log(`setSwapPools confirmed block=${receipt.blockNumber} fees=${targetFees.join(",")}`);
+  log(`setSwapPoolMaxTargetAweths confirmed block=${receipt.blockNumber} fees=${changedFees.join(",")}`);
+  return true;
 }
 
 async function compareLocalQuoteShadow(
@@ -838,23 +915,18 @@ async function runOnce(
     evaluation = await findBestQuote(quoteFallbackProvider, config);
   }
   const { best, poolDecisions } = evaluation;
-  const current = BigInt(await executor.maxTargetAweth());
-  const shouldUpdate = overDeviationThreshold(best.amountOut, current, config.deviationBps);
 
   log(
     [
       `recommended=${format(best.amountOut)}aWETH`,
       `fee=${best.fee}`,
       `reason=${best.reason}`,
-      `onchain=${format(current)}aWETH`,
-      `deltaBps=${deviationBps(best.amountOut, current)}`,
       `thresholdBps=${config.deviationBps}`,
       `bufferedProfit=${format(best.bufferedProfit)}WETH`,
       `profitBps=${best.profitBps.toString()}`,
       `ticks=${best.ticksCrossed}`,
       `quoteGas=${best.gasEstimate}`,
-      `poolDecisions=${formatPoolDecisions(poolDecisions)}`,
-      `update=${shouldUpdate}`
+      `poolDecisions=${formatPoolDecisions(poolDecisions)}`
     ].join(" ")
   );
 
@@ -862,32 +934,17 @@ async function runOnce(
     void compareLocalQuoteShadow(evaluationProvider, quoteFallbackProvider, config, best);
   }
 
-  await syncSwapPools(quoteProvider, quoteFallbackProvider, executor, config, poolDecisions);
-
-  if (!shouldUpdate) return;
-
-  if (config.dryRun) {
-    log(`dry-run skip setMaxTargetAweth(${best.amountOut.toString()})`);
-    return;
-  }
-
-  const tx = await executor.setMaxTargetAweth(best.amountOut);
-  log(`setMaxTargetAweth sent hash=${tx.hash}`);
-  const receipt = await tx.wait(1);
-  if (!receipt || receipt.status !== 1) {
-    throw new Error(`setMaxTargetAweth failed hash=${tx.hash}`);
-  }
-  log(`setMaxTargetAweth confirmed block=${receipt.blockNumber}`);
+  const updated = await syncSwapPools(quoteProvider, quoteFallbackProvider, executor, config, poolDecisions);
+  if (!updated) return;
 
   sendNotification(notifier, {
-    title: "aWETH Cap Updated",
+    title: "aWETH Pool Caps Updated",
     body: [
-      `New cap: ${format(best.amountOut)} aWETH`,
-      `Old cap: ${format(current)} aWETH`,
-      `Fee: ${best.fee}`,
+      `Best fee: ${best.fee}`,
+      `Best cap: ${format(best.amountOut)} aWETH`,
       `Reason: ${best.reason}`,
-      `Delta: ${deviationBps(best.amountOut, current)} bps`,
-      `Max buffer profit: ${format(best.bufferedProfit)} WETH`
+      `Max buffer profit: ${format(best.bufferedProfit)} WETH`,
+      `Pool caps: ${formatPoolDecisions(poolDecisions)}`
     ].join("\n")
   });
 }
@@ -987,7 +1044,7 @@ function startExecuteEventListener(
 ): ContractListener {
   const contract = new Contract(config.executorAddress, EXECUTOR_ABI, provider);
 
-  contract.on("ArbitrageExecuted", (flashAmount, wethSpent, profit, kairosPayment, caller, profitRecipient, event) => {
+  contract.on("ArbitrageExecuted", (flashAmount, wethSpent, profit, caller, profitRecipient, event) => {
     const hash = event?.log?.transactionHash ?? "unknown";
     log(
       [
@@ -996,7 +1053,6 @@ function startExecuteEventListener(
         `flash=${format(BigInt(flashAmount))}`,
         `spent=${format(BigInt(wethSpent))}`,
         `profit=${format(BigInt(profit))}`,
-        `kairos=${format(BigInt(kairosPayment))}`,
         `caller=${caller}`,
         `profitRecipient=${profitRecipient}`
       ].join(" ")
