@@ -29,13 +29,14 @@ const AWETH = "0xe50fA9b3c56FfB159cB0FCA61F5c9D750e8128c8";
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const MIN_SQRT_RATIO_PLUS_ONE = 4_295_128_740n;
 const SCALE_BPS = 10_000n;
-const LOCAL_REFINE_STEP_WEI = 100_000_000_000_000n;
+const LOCAL_REFINE_STEP_WEI = 10_000_000_000_000_000n;
 const LOCAL_REFINE_WINDOW_WEI = 50_000_000_000_000_000n;
 const LOCAL_VERIFY_STEP_WEI = LOCAL_REFINE_STEP_WEI;
 const LOCAL_VERIFY_RADIUS_STEPS = 2n;
 const DEFAULT_SWAP_POOL_MIN_AWETH_RATIO_BPS = 0;
 const WS_RECONNECT_DELAY_MS = 5_000;
 const EVENT_TX_DEDUPE_TTL_MS = 60_000;
+const LOCAL_TIMEOUT_GRACE_MS = 1_000;
 
 const QUOTER_ABI = [
   "function quoteExactOutputSingle((address tokenIn,address tokenOut,uint256 amount,uint24 fee,uint160 sqrtPriceLimitX96) params) returns (uint256 amountIn,uint160 sqrtPriceX96After,uint32 initializedTicksCrossed,uint256 gasEstimate)"
@@ -103,6 +104,7 @@ type QuoteEvaluation = {
 type QuoteRun = {
   evaluation: QuoteEvaluation;
   seeded: boolean;
+  source?: string;
 };
 
 type Config = {
@@ -351,6 +353,31 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: str
   }
 }
 
+async function withTimeoutNotice<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  label: string,
+  onTimeout: () => void
+): Promise<T> {
+  if (timeoutMs === 0) return promise;
+
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      onTimeout();
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+}
+
 function overDeviationThreshold(next: bigint, current: bigint, thresholdBps: number): boolean {
   if (current === 0n) return next !== 0n;
   const delta = next > current ? next - current : current - next;
@@ -373,6 +400,22 @@ function fallbackQuote(): Quote {
     fee: 0,
     outEth: 0,
     amountOut: 1n,
+    amountIn: 0n,
+    maxIn: 0n,
+    bufferedProfit: 0n,
+    profitBps: 0n,
+    sqrtPriceX96After: 0n,
+    ticksCrossed: 0,
+    gasEstimate: 0
+  };
+}
+
+function seedQuoteFromTarget(fee: number, amountOut: bigint): Quote {
+  return {
+    reason: "profitable-quote",
+    fee,
+    outEth: amountOutToEthNumber(amountOut),
+    amountOut,
     amountIn: 0n,
     maxIn: 0n,
     bufferedProfit: 0n,
@@ -710,10 +753,11 @@ async function scanSeededBestQuote(
 
   if (centers.length === 0) return null;
 
+  const seededStepEth = Math.max(config.fineStepEth, config.fineWindowEth / 15);
   const quoteGroups = await mapLimit(centers, config.concurrency, (quote) => {
-    const fineStart = Math.max(config.fineStepEth, quote.outEth - config.fineWindowEth);
+    const fineStart = Math.max(seededStepEth, quote.outEth - config.fineWindowEth);
     const fineEnd = Math.min(config.maxEth, quote.outEth + config.fineWindowEth);
-    return quoteMany(range(fineStart, fineEnd, config.fineStepEth), [quote.fee]);
+    return quoteMany(range(fineStart, fineEnd, seededStepEth), [quote.fee]);
   });
   const quotes = validQuotes(quoteGroups.flat());
   const best = bestQuoteByProfit(quotes);
@@ -726,9 +770,9 @@ async function scanSeededBestQuote(
     const quote = bestQuoteByProfit(quotes.filter((item) => item.fee === fee));
     if (!center || !quote) return false;
 
-    const fineStart = Math.max(config.fineStepEth, center.outEth - config.fineWindowEth);
+    const fineStart = Math.max(seededStepEth, center.outEth - config.fineWindowEth);
     const fineEnd = Math.min(config.maxEth, center.outEth + config.fineWindowEth);
-    return quote.outEth <= fineStart + config.fineStepEth / 10 || quote.outEth >= fineEnd - config.fineStepEth / 10;
+    return quote.outEth <= fineStart + seededStepEth / 10 || quote.outEth >= fineEnd - seededStepEth / 10;
   });
 
   if (edgeHit) return null;
@@ -893,11 +937,12 @@ async function verifyLocalEvaluationWithEthCall(
 async function refineLocalQuote(
   config: Config,
   center: Quote,
-  localQuoteRaw: (fee: number, amountOut: bigint) => Promise<Quote | null>
+  localQuoteRaw: (fee: number, amountOut: bigint) => Promise<Quote | null>,
+  windowWei = LOCAL_REFINE_WINDOW_WEI
 ): Promise<Quote | null> {
   const maxIndex = parseEther(String(config.maxEth)) / LOCAL_REFINE_STEP_WEI;
   const centerIndex = center.amountOut / LOCAL_REFINE_STEP_WEI;
-  const windowSteps = LOCAL_REFINE_WINDOW_WEI / LOCAL_REFINE_STEP_WEI;
+  const windowSteps = windowWei / LOCAL_REFINE_STEP_WEI;
   let low = centerIndex > windowSteps ? centerIndex - windowSteps : 1n;
   let high = centerIndex + windowSteps < maxIndex ? centerIndex + windowSteps : maxIndex;
   const cache = new Map<string, Quote | null>();
@@ -953,8 +998,13 @@ async function findBestLocalVerifiedQuote(
   const contexts = await buildLocalQuoteContexts(provider, fallbackProvider, config, blockTag);
   log(`hybrid local contexts ready block=${blockTag} elapsedMs=${elapsedMs(startedAt)}`);
   const sqrtPriceLimitX96 = JSBI.BigInt(MIN_SQRT_RATIO_PLUS_ONE.toString());
+  let localTimedOut = false;
 
   async function localQuoteRaw(fee: number, amountOut: bigint): Promise<Quote | null> {
+    if (localTimedOut) {
+      throw new Error("hybrid local refine/verify stopped after timeout");
+    }
+
     const context = contexts.get(fee);
     if (!context) return null;
 
@@ -975,35 +1025,64 @@ async function findBestLocalVerifiedQuote(
     }
   }
 
-  const refineStartedAt = performance.now();
-  const refinedQuotes = (
-    await mapLimit(
-      baseRun.evaluation.poolDecisions
-        .map((decision) => decision.quote)
-        .filter((quote): quote is Quote => quote !== null),
-      config.concurrency,
-      async (quote) => refineLocalQuote(config, quote, localQuoteRaw)
-    )
-  ).filter((quote): quote is Quote => quote !== null);
-  log(`hybrid local refine completed block=${blockTag} elapsedMs=${elapsedMs(refineStartedAt)}`);
-  const refinedBest = bestQuoteByProfit(refinedQuotes);
-  if (!refinedBest) {
-    throw new Error("hybrid local refine produced no profitable quotes");
+  async function refineAndVerify(): Promise<QuoteEvaluation> {
+    const refineStartedAt = performance.now();
+    const refinedQuotes = (
+      await mapLimit(
+        baseRun.evaluation.poolDecisions
+          .map((decision) => decision.quote)
+          .filter((quote): quote is Quote => quote !== null),
+        config.concurrency,
+        async (quote) => refineLocalQuote(config, quote, localQuoteRaw)
+      )
+    ).filter((quote): quote is Quote => quote !== null);
+    log(`hybrid local refine completed block=${blockTag} elapsedMs=${elapsedMs(refineStartedAt)}`);
+    const refinedBest = bestQuoteByProfit(refinedQuotes);
+    if (!refinedBest) {
+      throw new Error("hybrid local refine produced no profitable quotes");
+    }
+    const refinedEvaluation = {
+      best: refinedBest,
+      poolDecisions: buildPoolDecisions(config, refinedQuotes, refinedBest)
+    };
+    const verifyStartedAt = performance.now();
+    const verifiedEvaluation = await verifyLocalEvaluationWithEthCall(provider, config, refinedEvaluation, blockTag);
+    log(
+      `hybrid local quote verified block=${blockTag} verifyMs=${elapsedMs(verifyStartedAt)} totalMs=${elapsedMs(
+        startedAt
+      )}`
+    );
+    return verifiedEvaluation;
   }
-  const refinedEvaluation = {
-    best: refinedBest,
-    poolDecisions: buildPoolDecisions(config, refinedQuotes, refinedBest)
-  };
-  const verifyStartedAt = performance.now();
-  const verifiedEvaluation = await verifyLocalEvaluationWithEthCall(provider, config, refinedEvaluation, blockTag);
-  log(
-    `hybrid local quote verified block=${blockTag} verifyMs=${elapsedMs(verifyStartedAt)} totalMs=${elapsedMs(
-      startedAt
-    )}`
-  );
+
+  const remainingTimeoutMs =
+    config.localQuoteTimeoutMs === 0
+      ? 0
+      : Math.max(1, config.localQuoteTimeoutMs - Math.ceil(performance.now() - startedAt));
+  let verifiedEvaluation: QuoteEvaluation;
+  let source = "hybrid_local_verified";
+  try {
+    verifiedEvaluation = await withTimeoutNotice(
+      refineAndVerify(),
+      remainingTimeoutMs,
+      "hybrid local refine/verify",
+      () => {
+        localTimedOut = true;
+      }
+    );
+  } catch (error) {
+    console.warn(
+      `[${timestamp()}] hybrid local refine/verify failed; using eth_call center scan result:`,
+      error
+    );
+    verifiedEvaluation = baseRun.evaluation;
+    source = "hybrid_eth_call_center";
+  }
+
   return {
     evaluation: verifiedEvaluation,
-    seeded: baseRun.seeded
+    seeded: baseRun.seeded,
+    source
   };
 }
 
@@ -1363,6 +1442,62 @@ async function syncSwapPools(
   return true;
 }
 
+async function startupSeedEvaluationFromExecutor(executor: Contract, config: Config): Promise<QuoteEvaluation | null> {
+  let currentFees: number[];
+  let currentMaxTargetAweths: bigint[];
+
+  try {
+    const [, feesRaw, targetsRaw] = await executor.getSwapPoolsWithMaxTargetAweths();
+    currentFees = Array.from(feesRaw as Iterable<bigint | number>).map((fee) => Number(fee));
+    currentMaxTargetAweths = Array.from(targetsRaw as Iterable<bigint | number>).map((target) => BigInt(target));
+  } catch {
+    const [, feesRaw] = await executor.getSwapPools();
+    currentFees = Array.from(feesRaw as Iterable<bigint | number>).map((fee) => Number(fee));
+
+    try {
+      const targetsRaw = await executor.getSwapPoolMaxTargetAweths();
+      currentMaxTargetAweths = Array.from(targetsRaw as Iterable<bigint | number>).map((target) => BigInt(target));
+    } catch {
+      const legacyGlobalTarget = BigInt(await executor.maxTargetAweth());
+      currentMaxTargetAweths = currentFees.map(() => legacyGlobalTarget);
+    }
+  }
+
+  const maxAmountOut = parseEther(String(config.maxEth));
+  const quoteByFee = new Map<number, Quote>();
+  for (let index = 0; index < currentFees.length; index += 1) {
+    const fee = currentFees[index];
+    const amountOut = currentMaxTargetAweths[index] ?? 0n;
+    if (!config.poolFees.includes(fee) || amountOut <= 1n || amountOut > maxAmountOut) {
+      continue;
+    }
+    quoteByFee.set(fee, seedQuoteFromTarget(fee, amountOut));
+  }
+
+  const quotes = config.poolFees.map((fee) => quoteByFee.get(fee)).filter((quote): quote is Quote => quote !== undefined);
+  if (quotes.length === 0) {
+    log("startup seeded scan disabled currentTargets=none");
+    return null;
+  }
+
+  log(
+    `startup seeded scan enabled targets=[${quotes.map((quote) => `${quote.fee}:${format(quote.amountOut)}`).join(",")}]`
+  );
+  const best = [...quotes].sort((a, b) => (a.amountOut < b.amountOut ? 1 : -1))[0];
+  return {
+    best,
+    poolDecisions: config.poolFees.map((fee) => {
+      const quote = quoteByFee.get(fee) ?? null;
+      return {
+        fee,
+        quote,
+        keep: quote !== null,
+        reason: quote ? "within-ratio" : "no-profitable-quote"
+      };
+    })
+  };
+}
+
 async function runOnce(
   quoteProvider: JsonRpcProvider,
   quoteFallbackProvider: JsonRpcProvider | null,
@@ -1378,11 +1513,12 @@ async function runOnce(
   try {
     const result = await withTimeout(
       findBestLocalVerifiedQuote(quoteProvider, quoteFallbackProvider, config, seedEvaluation),
-      config.localQuoteTimeoutMs,
+      config.localQuoteTimeoutMs === 0 ? 0 : config.localQuoteTimeoutMs + LOCAL_TIMEOUT_GRACE_MS,
       "hybrid local verified quote"
     );
     evaluation = result.evaluation;
     seeded = result.seeded;
+    quoteSource = result.source ?? quoteSource;
   } catch (error) {
     console.warn(`[${timestamp()}] hybrid local verified quote failed; falling back to eth_call scan:`, error);
     try {
@@ -1492,8 +1628,12 @@ class EvaluationRunner {
     }
   }
 
-  private seedEvaluationFor(reason: string, eventFees: Set<number>): QuoteEvaluation | null {
-    if (reason === "startup" || reason === "interval" || !this.lastEvaluation) {
+  private async seedEvaluationFor(reason: string, eventFees: Set<number>): Promise<QuoteEvaluation | null> {
+    if (reason === "startup" && !this.lastEvaluation) {
+      return startupSeedEvaluationFromExecutor(this.executor, this.config);
+    }
+
+    if (reason === "interval" || !this.lastEvaluation) {
       return null;
     }
 
@@ -1514,7 +1654,7 @@ class EvaluationRunner {
     while (reason) {
       log(`evaluation start reason=${reason}`);
       try {
-        const seedEvaluation = this.seedEvaluationFor(reason, eventFees);
+        const seedEvaluation = await this.seedEvaluationFor(reason, eventFees);
         this.lastEvaluation = await runOnce(
           this.quoteProvider,
           this.quoteFallbackProvider,
