@@ -132,6 +132,7 @@ type Config = {
   eventDebounceMs: number;
   intervalMs: number;
   deviationBps: number;
+  deviationAweth: bigint;
   dryRun: boolean;
   barkBaseUrl: string;
   barkDeviceKey: string | null;
@@ -235,6 +236,19 @@ function parseBps(name: string, fallback: number): number {
   return parsed;
 }
 
+function parseEtherAmount(name: string, fallback: string): bigint {
+  const value = optional(name) ?? fallback;
+  try {
+    const parsed = parseEther(value);
+    if (parsed < 0n) {
+      throw new Error("negative");
+    }
+    return parsed;
+  } catch {
+    throw new Error(`Invalid ETH amount in ${name}: ${value}`);
+  }
+}
+
 function parseAddress(name: string, fallback: string): string {
   const value = optional(name) ?? fallback;
   if (!isAddress(value)) {
@@ -275,6 +289,7 @@ function loadConfig(): Config {
     eventDebounceMs: parseNonNegativeInteger("EVENT_DEBOUNCE_MS", 2_000),
     intervalMs: parseNonNegativeInteger("MONITOR_INTERVAL_MS", 600_000),
     deviationBps: parseInteger("UPDATE_DEVIATION_BPS", 500),
+    deviationAweth: parseEtherAmount("UPDATE_DEVIATION_AWETH", "0.2"),
     dryRun,
     barkBaseUrl: optional("BARK_BASE_URL") ?? "https://api.day.app",
     barkDeviceKey: optional("BARK_DEVICE_KEY"),
@@ -380,10 +395,10 @@ async function withTimeoutNotice<T>(
   }
 }
 
-function overDeviationThreshold(next: bigint, current: bigint, thresholdBps: number): boolean {
+function overDeviationThreshold(next: bigint, current: bigint, thresholdBps: number, thresholdAweth: bigint): boolean {
   if (current === 0n) return next !== 0n;
   const delta = next > current ? next - current : current - next;
-  return delta * SCALE_BPS > current * BigInt(thresholdBps);
+  return delta * SCALE_BPS > current * BigInt(thresholdBps) || delta > thresholdAweth;
 }
 
 function errorCode(error: unknown): string | null {
@@ -1273,10 +1288,10 @@ function sameAddressList(left: string[], right: string[]): boolean {
   );
 }
 
-function targetChangedIndexes(left: bigint[], right: bigint[], thresholdBps: number): number[] {
+function targetChangedIndexes(left: bigint[], right: bigint[], thresholdBps: number, thresholdAweth: bigint): number[] {
   const indexes: number[] = [];
   for (let index = 0; index < left.length; index += 1) {
-    if (overDeviationThreshold(left[index], right[index] ?? 0n, thresholdBps)) {
+    if (overDeviationThreshold(left[index], right[index] ?? 0n, thresholdBps, thresholdAweth)) {
       indexes.push(index);
     }
   }
@@ -1322,6 +1337,7 @@ function logEvaluation(source: string, evaluation: QuoteEvaluation, config: Conf
       `fee=${best.fee}`,
       `reason=${best.reason}`,
       `thresholdBps=${config.deviationBps}`,
+      `thresholdAweth=${format(config.deviationAweth)}`,
       `bufferedProfit=${format(best.bufferedProfit)}WETH`,
       `profitBps=${best.profitBps.toString()}`,
       `ticks=${best.ticksCrossed}`,
@@ -1395,7 +1411,12 @@ async function syncSwapPools(
 
   const feeListChanged = !sameFeeList(currentFees, targetFees);
   const poolListChanged = !sameAddressList(currentPools, targetPools);
-  const changedIndexes = targetChangedIndexes(targetMaxTargetAweths, currentMaxTargetAweths, config.deviationBps);
+  const changedIndexes = targetChangedIndexes(
+    targetMaxTargetAweths,
+    currentMaxTargetAweths,
+    config.deviationBps,
+    config.deviationAweth
+  );
 
   if (!feeListChanged && !poolListChanged && changedIndexes.length === 0) {
     log(
@@ -2004,6 +2025,7 @@ async function main(): Promise<void> {
       `eventDebounceMs=${config.eventDebounceMs}`,
       `intervalMs=${config.intervalMs}`,
       `deviationBps=${config.deviationBps}`,
+      `deviationAweth=${format(config.deviationAweth)}`,
       `dryRun=${config.dryRun}`,
       `bark=${notifier ? "enabled" : "disabled"}`
     ].join(" ")

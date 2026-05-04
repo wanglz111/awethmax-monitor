@@ -1,8 +1,8 @@
 # awethmax-monitor
 
-Monitors the recommended per-fee `maxTargetAweth` values for the Arbitrum aWETH/WETH Uniswap V3 pools and updates the executor contract only when a recommendation deviates from the on-chain value by more than `UPDATE_DEVIATION_BPS`.
+Monitors the recommended per-fee `maxTargetAweth` values for the Arbitrum aWETH/WETH Uniswap V3 pools and updates the executor contract only when a recommendation deviates from the on-chain value by more than `UPDATE_DEVIATION_BPS` or more than `UPDATE_DEVIATION_AWETH`.
 
-Default threshold is `500` bps, meaning strictly more than 5%. The monitor runs every 10 minutes by default, evaluates immediately after a successful `ArbitrageExecuted` event from the executor contract, and re-evaluates immediately when any configured fee pool emits `Swap`, `Mint`, `Burn`, `Collect`, or `Flash`.
+Default thresholds are `500` bps, meaning strictly more than 5%, or `0.2` aWETH. The monitor runs every 10 minutes by default, evaluates immediately after a successful `ArbitrageExecuted` event from the executor contract, and re-evaluates immediately when any configured fee pool emits `Swap`, `Mint`, `Burn`, `Collect`, or `Flash`.
 
 If the WebSocket connection closes or errors, the monitor tears down the old event listeners and reconnects after 5 seconds. The periodic interval continues to run as a fallback while WebSocket events are unavailable.
 
@@ -10,7 +10,7 @@ Quote scans are batched through QuoterV2 Multicall. With the fallback scan defau
 
 Startup evaluations first try to use the executor's current per-fee caps as seeds, so restarts can run a sparse QuoterV2 probe around already deployed caps before local refinement. After startup, event-triggered evaluations reuse the previous per-fee best caps as sparse seeded probes for faster reaction. If a seeded result lands on the edge of the window, the monitor falls back to the full coarse scan so large moves are not missed. Periodic interval evaluations always run the full scan, so the interval acts as a slower correction pass.
 
-After each evaluation, the monitor keeps the configured fee tiers fixed on the executor. If the on-chain pool or fee list is not aligned with `POOL_FEES`, it syncs the full list once through `setSwapPoolsWithMaxTargetAweths(address[],uint24[],uint256[])`. Once the list is aligned, normal updates only call `setSwapPoolMaxTargetAweths(uint24[],uint256[])` for fee tiers whose cap moved by more than `UPDATE_DEVIATION_BPS`. Fee tiers with no profitable quote stay in the list with a `1 wei` cap, which makes the executor skip them before calling the quoter.
+After each evaluation, the monitor keeps the configured fee tiers fixed on the executor. If the on-chain pool or fee list is not aligned with `POOL_FEES`, it syncs the full list once through `setSwapPoolsWithMaxTargetAweths(address[],uint24[],uint256[])`. Once the list is aligned, normal updates only call `setSwapPoolMaxTargetAweths(uint24[],uint256[])` for fee tiers whose cap moved by more than `UPDATE_DEVIATION_BPS` or more than `UPDATE_DEVIATION_AWETH`. Fee tiers with no profitable quote stay in the list with a `1 wei` cap, which makes the executor skip them before calling the quoter.
 
 Set `MONITOR_INTERVAL_MS=0` to disable the periodic fallback and run from startup plus WebSocket events only.
 
@@ -28,6 +28,7 @@ QUOTE_RPC_URL=https://arbitrum.blockpi.network/v1/rpc/YOUR_BLOCKPI_KEY
 POOL_FEES=100,500,3000
 SWAP_POOL_MIN_AWETH_RATIO_BPS=0
 UPDATE_DEVIATION_BPS=500
+UPDATE_DEVIATION_AWETH=0.2
 
 BARK_BASE_URL=https://api.day.app
 BARK_DEVICE_KEY=YOUR_BARK_DEVICE_KEY
@@ -80,4 +81,5 @@ It also uploads a deploy artifact containing `docker-compose.yml` and `.env.exam
 - `SWAP_POOL_MIN_AWETH_RATIO_BPS`: optional minimum per-pool aWETH target ratio versus the best pool before a profitable quote gets a real cap; default `0`, meaning every profitable configured fee tier gets its own cap. Fee tiers without a kept quote are written as `1 wei`.
 - `EVENT_DEBOUNCE_MS`: delay used to merge pool/executor events before re-evaluating, default `2000`.
 - `MONITOR_INTERVAL_MS`: monitor interval, default `600000`; set `0` to disable the interval and only evaluate on startup/events.
-- `UPDATE_DEVIATION_BPS`: per-fee cap update threshold, default `500`.
+- `UPDATE_DEVIATION_BPS`: per-fee relative cap update threshold, default `500`.
+- `UPDATE_DEVIATION_AWETH`: per-fee absolute cap update threshold in aWETH, default `0.2`.
