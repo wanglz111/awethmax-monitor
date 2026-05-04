@@ -398,7 +398,7 @@ async function withTimeoutNotice<T>(
 function overDeviationThreshold(next: bigint, current: bigint, thresholdBps: number, thresholdAweth: bigint): boolean {
   if (current === 0n) return next !== 0n;
   const delta = next > current ? next - current : current - next;
-  return delta * SCALE_BPS > current * BigInt(thresholdBps) || delta > thresholdAweth;
+  return delta * SCALE_BPS > current * BigInt(thresholdBps) && delta > thresholdAweth;
 }
 
 function errorCode(error: unknown): string | null {
