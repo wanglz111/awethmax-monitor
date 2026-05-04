@@ -1,5 +1,6 @@
 services:
   awethmax-monitor:
+    build: .
     image: ghcr.io/wanglz111/awethmax-monitor:latest
     env_file:
       - .env

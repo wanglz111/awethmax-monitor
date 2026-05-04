@@ -29,7 +29,7 @@ const AWETH = "0xe50fA9b3c56FfB159cB0FCA61F5c9D750e8128c8";
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const MIN_SQRT_RATIO_PLUS_ONE = 4_295_128_740n;
 const SCALE_BPS = 10_000n;
-const LOCAL_REFINE_STEP_WEI = 10_000_000_000_000_000n;
+const LOCAL_REFINE_STEP_WEI = 100_000_000_000_000_000n;
 const LOCAL_REFINE_WINDOW_WEI = 50_000_000_000_000_000n;
 const LOCAL_VERIFY_STEP_WEI = LOCAL_REFINE_STEP_WEI;
 const LOCAL_VERIFY_RADIUS_STEPS = 2n;
@@ -125,6 +125,7 @@ type Config = {
   fineWindowEth: number;
   concurrency: number;
   quoteBatchSize: number;
+  localQuoteEnabled: boolean;
   localQuoteTimeoutMs: number;
   localQuoteShadow: boolean;
   swapPoolMinAwethRatioBps: number;
@@ -267,6 +268,7 @@ function loadConfig(): Config {
     fineWindowEth: parseNumber("FINE_WINDOW_ETH", 3),
     concurrency: parseInteger("QUOTE_CONCURRENCY", 6),
     quoteBatchSize: parseInteger("QUOTE_BATCH_SIZE", 80),
+    localQuoteEnabled: parseBool("LOCAL_QUOTE_ENABLED", false),
     localQuoteTimeoutMs: parseNonNegativeInteger("LOCAL_QUOTE_TIMEOUT_MS", 120_000),
     localQuoteShadow: parseBool("LOCAL_QUOTE_SHADOW", false),
     swapPoolMinAwethRatioBps: parseBps("SWAP_POOL_MIN_AWETH_RATIO_BPS", DEFAULT_SWAP_POOL_MIN_AWETH_RATIO_BPS),
@@ -993,6 +995,15 @@ async function findBestLocalVerifiedQuote(
     `hybrid eth_call center scan completed seeded=${baseRun.seeded} elapsedMs=${elapsedMs(ethCallStartedAt)}`
   );
 
+  if (!config.localQuoteEnabled) {
+    log("hybrid local refine/verify disabled; using eth_call center scan result");
+    return {
+      evaluation: baseRun.evaluation,
+      seeded: baseRun.seeded,
+      source: "hybrid_eth_call_center"
+    };
+  }
+
   const blockTag = await provider.getBlockNumber();
   log(`hybrid local refine block pinned block=${blockTag}`);
   const contexts = await buildLocalQuoteContexts(provider, fallbackProvider, config, blockTag);
@@ -1055,16 +1066,18 @@ async function findBestLocalVerifiedQuote(
     return verifiedEvaluation;
   }
 
-  const remainingTimeoutMs =
-    config.localQuoteTimeoutMs === 0
-      ? 0
-      : Math.max(1, config.localQuoteTimeoutMs - Math.ceil(performance.now() - startedAt));
+  const localTimeoutMs = config.localQuoteTimeoutMs;
   let verifiedEvaluation: QuoteEvaluation;
   let source = "hybrid_local_verified";
   try {
+    log(
+      `hybrid local refine/verify starting block=${blockTag} timeoutMs=${
+        localTimeoutMs === 0 ? "disabled" : localTimeoutMs
+      }`
+    );
     verifiedEvaluation = await withTimeoutNotice(
       refineAndVerify(),
-      remainingTimeoutMs,
+      localTimeoutMs,
       "hybrid local refine/verify",
       () => {
         localTimedOut = true;
@@ -1513,7 +1526,7 @@ async function runOnce(
   try {
     const result = await withTimeout(
       findBestLocalVerifiedQuote(quoteProvider, quoteFallbackProvider, config, seedEvaluation),
-      config.localQuoteTimeoutMs === 0 ? 0 : config.localQuoteTimeoutMs + LOCAL_TIMEOUT_GRACE_MS,
+      config.localQuoteTimeoutMs === 0 ? 0 : config.localQuoteTimeoutMs * 2 + LOCAL_TIMEOUT_GRACE_MS,
       "hybrid local verified quote"
     );
     evaluation = result.evaluation;
