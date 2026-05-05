@@ -37,6 +37,7 @@ const DEFAULT_SWAP_POOL_MIN_AWETH_RATIO_BPS = 0;
 const WS_RECONNECT_DELAY_MS = 5_000;
 const EVENT_TX_DEDUPE_TTL_MS = 60_000;
 const LOCAL_TIMEOUT_GRACE_MS = 1_000;
+const FORCE_FULL_SCAN_INTERVAL_MS = 60 * 60 * 1000;
 
 const QUOTER_ABI = [
   "function quoteExactOutputSingle((address tokenIn,address tokenOut,uint256 amount,uint24 fee,uint160 sqrtPriceLimitX96) params) returns (uint256 amountIn,uint160 sqrtPriceX96After,uint32 initializedTicksCrossed,uint256 gasEstimate)"
@@ -782,9 +783,18 @@ async function scanSeededBestQuote(
   if (!best) return null;
 
   const centerByFee = new Map(centers.map((quote) => [quote.fee, quote]));
+  const quoteByFee = new Map(
+    [...new Set(centers.map((quote) => quote.fee))].map((fee) => [
+      fee,
+      bestQuoteByProfit(quotes.filter((item) => item.fee === fee))
+    ])
+  );
+  const missingCenterQuote = centers.some((center) => !quoteByFee.get(center.fee));
+  if (missingCenterQuote) return null;
+
   const edgeHit = config.poolFees.some((fee) => {
     const center = centerByFee.get(fee);
-    const quote = bestQuoteByProfit(quotes.filter((item) => item.fee === fee));
+    const quote = quoteByFee.get(fee);
     if (!center || !quote) return false;
 
     const fineStart = Math.max(seededStepEth, center.outEth - config.fineWindowEth);
@@ -1383,7 +1393,8 @@ async function syncSwapPools(
   quoteFallbackProvider: JsonRpcProvider | null,
   executor: Contract,
   config: Config,
-  decisions: PoolDecision[]
+  decisions: PoolDecision[],
+  forceTargetSync = false
 ): Promise<boolean> {
   const targetFees = config.poolFees;
   const targetMaxTargetAweths = targetFees.map((fee) => {
@@ -1411,12 +1422,9 @@ async function syncSwapPools(
 
   const feeListChanged = !sameFeeList(currentFees, targetFees);
   const poolListChanged = !sameAddressList(currentPools, targetPools);
-  const changedIndexes = targetChangedIndexes(
-    targetMaxTargetAweths,
-    currentMaxTargetAweths,
-    config.deviationBps,
-    config.deviationAweth
-  );
+  const changedIndexes = forceTargetSync
+    ? targetFees.map((_, index) => index)
+    : targetChangedIndexes(targetMaxTargetAweths, currentMaxTargetAweths, config.deviationBps, config.deviationAweth);
 
   if (!feeListChanged && !poolListChanged && changedIndexes.length === 0) {
     log(
@@ -1538,7 +1546,8 @@ async function runOnce(
   executor: Contract,
   config: Config,
   notifier: BarkNotifier | null,
-  seedEvaluation: QuoteEvaluation | null
+  seedEvaluation: QuoteEvaluation | null,
+  forceTargetSync = false
 ): Promise<QuoteEvaluation> {
   let evaluation: QuoteEvaluation;
   let seeded = false;
@@ -1576,9 +1585,15 @@ async function runOnce(
     void compareLocalQuoteShadow(evaluationProvider, quoteFallbackProvider, config, evaluation.best);
   }
 
-  await syncSwapPools(quoteProvider, quoteFallbackProvider, executor, config, evaluation.poolDecisions);
+  await syncSwapPools(quoteProvider, quoteFallbackProvider, executor, config, evaluation.poolDecisions, forceTargetSync);
   return evaluation;
 }
+
+type SeedDecision = {
+  evaluation: QuoteEvaluation | null;
+  forceTargetSync: boolean;
+  forcedFullScan: boolean;
+};
 
 class EvaluationRunner {
   private inFlight = false;
@@ -1588,6 +1603,7 @@ class EvaluationRunner {
   private pendingEventReason: string | null = null;
   private pendingEventFees = new Set<number>();
   private lastEvaluation: QuoteEvaluation | null = null;
+  private lastForcedFullScanAt = Date.now();
   private readonly seenEventTxs = new Map<string, number>();
 
   public constructor(
@@ -1662,24 +1678,46 @@ class EvaluationRunner {
     }
   }
 
-  private async seedEvaluationFor(reason: string, eventFees: Set<number>): Promise<QuoteEvaluation | null> {
+  private async seedEvaluationFor(reason: string, eventFees: Set<number>): Promise<SeedDecision> {
     if (reason === "startup" && !this.lastEvaluation) {
-      return startupSeedEvaluationFromExecutor(this.executor, this.config);
+      return {
+        evaluation: await startupSeedEvaluationFromExecutor(this.executor, this.config),
+        forceTargetSync: false,
+        forcedFullScan: false
+      };
     }
 
-    if (reason === "interval" || !this.lastEvaluation) {
-      return null;
+    if (!this.lastEvaluation) {
+      return { evaluation: null, forceTargetSync: false, forcedFullScan: false };
+    }
+
+    if (reason === "interval") {
+      const now = Date.now();
+      if (now - this.lastForcedFullScanAt >= FORCE_FULL_SCAN_INTERVAL_MS) {
+        log(`interval forced full scan elapsedMs=${now - this.lastForcedFullScanAt}`);
+        return { evaluation: null, forceTargetSync: true, forcedFullScan: true };
+      }
+
+      const missingFees = this.config.poolFees.filter((fee) => {
+        const decision = this.lastEvaluation?.poolDecisions.find((item) => item.fee === fee);
+        return !decision?.quote;
+      });
+      if (missingFees.length > 0) {
+        log(`interval seeded scan disabled previousQuote=none fees=${missingFees.join(",")}`);
+        return { evaluation: null, forceTargetSync: false, forcedFullScan: false };
+      }
+      return { evaluation: this.lastEvaluation, forceTargetSync: false, forcedFullScan: false };
     }
 
     for (const fee of eventFees) {
       const decision = this.lastEvaluation.poolDecisions.find((item) => item.fee === fee);
       if (!decision?.quote) {
         log(`seeded scan disabled reason=${reason} fee=${fee} previousQuote=none`);
-        return null;
+        return { evaluation: null, forceTargetSync: false, forcedFullScan: false };
       }
     }
 
-    return this.lastEvaluation;
+    return { evaluation: this.lastEvaluation, forceTargetSync: false, forcedFullScan: false };
   }
 
   private async runLoop(initialReason: string, initialEventFees: Set<number>): Promise<void> {
@@ -1688,15 +1726,19 @@ class EvaluationRunner {
     while (reason) {
       log(`evaluation start reason=${reason}`);
       try {
-        const seedEvaluation = await this.seedEvaluationFor(reason, eventFees);
+        const seedDecision = await this.seedEvaluationFor(reason, eventFees);
         this.lastEvaluation = await runOnce(
           this.quoteProvider,
           this.quoteFallbackProvider,
           this.executor,
           this.config,
           this.notifier,
-          seedEvaluation
+          seedDecision.evaluation,
+          seedDecision.forceTargetSync
         );
+        if (seedDecision.forcedFullScan) {
+          this.lastForcedFullScanAt = Date.now();
+        }
       } catch (error) {
         console.error(`[${timestamp()}] evaluation failed reason=${reason}:`, error);
         sendNotification(this.notifier, {
@@ -2024,6 +2066,7 @@ async function main(): Promise<void> {
       `swapPoolMinAwethRatioBps=${config.swapPoolMinAwethRatioBps}`,
       `eventDebounceMs=${config.eventDebounceMs}`,
       `intervalMs=${config.intervalMs}`,
+      `forceFullScanIntervalMs=${FORCE_FULL_SCAN_INTERVAL_MS}`,
       `deviationBps=${config.deviationBps}`,
       `deviationAweth=${format(config.deviationAweth)}`,
       `dryRun=${config.dryRun}`,
