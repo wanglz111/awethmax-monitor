@@ -34,6 +34,7 @@ const LOCAL_REFINE_WINDOW_WEI = 50_000_000_000_000_000n;
 const LOCAL_VERIFY_STEP_WEI = LOCAL_REFINE_STEP_WEI;
 const LOCAL_VERIFY_RADIUS_STEPS = 2n;
 const DEFAULT_SWAP_POOL_MIN_AWETH_RATIO_BPS = 0;
+const MIN_POOL_BUFFERED_PROFIT_WEI = parseEther("0.0005");
 const WS_RECONNECT_DELAY_MS = 5_000;
 const EVENT_TX_DEDUPE_TTL_MS = 60_000;
 const LOCAL_TIMEOUT_GRACE_MS = 1_000;
@@ -94,7 +95,7 @@ type PoolDecision = {
   fee: number;
   quote: Quote | null;
   keep: boolean;
-  reason: "best" | "within-ratio" | "below-ratio" | "no-profitable-quote";
+  reason: "best" | "within-ratio" | "below-ratio" | "below-profit-threshold" | "no-profitable-quote";
 };
 
 type QuoteEvaluation = {
@@ -585,6 +586,15 @@ function buildPoolDecisions(config: Config, quotes: Quote[], bestQuote?: Quote):
         quote,
         keep: false,
         reason: "no-profitable-quote"
+      };
+    }
+
+    if (quote.bufferedProfit < MIN_POOL_BUFFERED_PROFIT_WEI) {
+      return {
+        fee,
+        quote,
+        keep: false,
+        reason: "below-profit-threshold"
       };
     }
 
@@ -1309,7 +1319,7 @@ function targetChangedIndexes(left: bigint[], right: bigint[], thresholdBps: num
 }
 
 function targetAmountForDecision(decision: PoolDecision): bigint {
-  return decision.quote?.amountOut ?? 1n;
+  return decision.keep ? decision.quote?.amountOut ?? 1n : 1n;
 }
 
 function formatPoolDecisions(decisions: PoolDecision[]): string {
